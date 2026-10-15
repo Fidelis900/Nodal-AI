@@ -621,14 +621,6 @@ export const config = new Proxy({} as AgentConfig, {
       throw _configError;
     }
     if (!_config) {
-      const hasAnyEnvConfig = Object.keys(process.env).some((key) =>
-        ['HORIZON_URL', 'SOROBAN_RPC_URL', 'AGENT_SECRET_KEY', 'X402_ASSET_ISSUER'].includes(key)
-      );
-
-      if (!hasAnyEnvConfig) {
-        return Reflect.get(FALLBACK_CONFIG, prop, receiver);
-      }
-
       try {
         _config = loadConfigSync();
       } catch (err: any) {

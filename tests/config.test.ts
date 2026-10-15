@@ -433,4 +433,21 @@ describe("config.ts — comprehensive env-var validation (issue #444)", () => {
     expect(cfg.AGENT_SPENDING_LIMIT).toBe("9999");
     expect(exitSpy).not.toHaveBeenCalled();
   });
+
+  it("fails with validation error when environment is empty", async () => {
+    delete process.env.HORIZON_URL;
+    delete process.env.SOROBAN_RPC_URL;
+    delete process.env.AGENT_SECRET_KEY;
+    delete process.env.AGENT_SECRET_KEY_ARN;
+    delete process.env.X402_ASSET_ISSUER;
+
+    await expect(async () => {
+      const { config } = await import("../backend/config");
+      void config.HORIZON_URL;
+    }).rejects.toThrow("process.exit: 1");
+
+    expect(stderrSpy).toHaveBeenCalledWith(
+      expect.stringContaining("Invalid environment — fix the following before starting")
+    );
+  });
 });
