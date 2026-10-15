@@ -712,10 +712,6 @@ export class PayFiAgent extends EventEmitter {
             data = await this.accountHistoryTool.fetch(task.payload);
             break;
 
-          case 'transaction_build':
-            data = await this.transactionBuilderTool.execute(task.payload);
-            break;
-
           case 'soroban_deploy':
             data = await this.sorobanDeployTool.execute(task.payload);
             break;
