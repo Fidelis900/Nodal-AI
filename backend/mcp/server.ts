@@ -5,7 +5,9 @@
  * Exposes tools over stdio and HTTP transports.
  */
 
+import { createHash, timingSafeEqual } from 'crypto';
 import { PayFiAgent, VALUE_MOVING_TASK_TYPES } from '../agent';
+import { config } from '../config';
 import { createLogger } from '../utils/logger';
 
 const log = createLogger('mcp');
@@ -173,9 +175,33 @@ export async function startMCPServer(agent: PayFiAgent): Promise<void> {
  */
 import express from 'express';
 
+/**
+ * Constant-time token comparison; both sides are hashed so the buffers are
+ * always the same length.
+ */
+function tokensMatch(given: string, expected: string): boolean {
+  const a = createHash('sha256').update(given).digest();
+  const b = createHash('sha256').update(expected).digest();
+  return timingSafeEqual(a, b);
+}
+
 export function startMCPHTTPServer(agent: PayFiAgent, port = 3001): void {
   const app = express();
   app.use(express.json());
+
+  // Require `Authorization: Bearer <ADMIN_API_TOKEN>` when a token is configured.
+  app.use((req, res, next) => {
+    const token = config.ADMIN_API_TOKEN;
+    const [scheme, given] = (req.headers.authorization ?? '').split(' ');
+    if (
+      !token ||
+      (scheme?.toLowerCase() === 'bearer' && given !== undefined && tokensMatch(given, token))
+    ) {
+      next();
+      return;
+    }
+    res.status(401).json({ error: 'Unauthorized' });
+  });
 
   app.post('/mcp', async (req, res) => {
     const response = await handleRequest(agent, req.body as MCPRequest);

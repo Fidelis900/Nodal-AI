@@ -3,11 +3,15 @@
   "version": "1.0.0",
   "description": "Modular, secure Stellar Agent Kit with PayFi / x402 support",
   "private": true,
+  "bin": {
+    "nodal-mcp": "dist/backend/mcp/index.js"
+  },
   "engines": {
     "node": ">=22.0.0"
   },
   "scripts": {
     "mcp": "npx ts-node backend/mcp/index.ts",
+    "mcp:start": "node dist/backend/mcp/index.js",
     "setup": "npx ts-node scripts/setup.ts",
     "doctor": "npx ts-node scripts/doctor.ts",
     "audit:verify": "npx ts-node scripts/audit_verify.ts",
