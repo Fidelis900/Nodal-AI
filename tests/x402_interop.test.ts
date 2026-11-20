@@ -8,6 +8,7 @@
 
 import { describe, it, expect, vi, beforeEach, afterEach, beforeAll, afterAll } from 'vitest';
 import { randomUUID } from 'crypto';
+import { Asset, Networks } from '@stellar/stellar-sdk';
 import type { Keypair } from '@stellar/stellar-sdk';
 import { config, AgentConfig } from '../backend/config';
 import { X402PaymentTool } from '../backend/tools/X402PaymentTool';
@@ -384,6 +385,53 @@ describe('x402 v2 Interoperability', () => {
 
       expect(httpClient.createPaymentPayload).not.toHaveBeenCalled();
       expect(spendingTracker.total()).toBe(0);
+    });
+
+    describe('X402_ALLOWED_ASSETS', () => {
+      const ISSUER = 'GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN';
+      const EURC_CONTRACT = new Asset('EURC', ISSUER).contractId(Networks.TESTNET);
+      const XLM_CONTRACT = Asset.native().contractId(Networks.TESTNET);
+      const mutable = config as unknown as { X402_ALLOWED_ASSETS: string | undefined };
+
+      afterEach(() => {
+        mutable.X402_ALLOWED_ASSETS = undefined;
+      });
+
+      it('selects a second allowed CODE:ISSUER asset by its SAC contract id', async () => {
+        mutable.X402_ALLOWED_ASSETS = `EURC:${ISSUER}`;
+        httpClient.getPaymentRequiredResponse.mockReturnValue({
+          accepts: [requirement({ asset: EURC_CONTRACT })],
+        });
+        stubPaidServer();
+
+        const { settlement } = await buyer().fetch(PAID_URL);
+
+        expect(settlement?.success).toBe(true);
+        expect(httpClient.createPaymentPayload).toHaveBeenCalled();
+      });
+
+      it('maps XLM to the native SAC', async () => {
+        mutable.X402_ALLOWED_ASSETS = 'XLM';
+        httpClient.getPaymentRequiredResponse.mockReturnValue({
+          accepts: [requirement({ asset: XLM_CONTRACT })],
+        });
+        stubPaidServer();
+
+        const { settlement } = await buyer().fetch(PAID_URL);
+
+        expect(settlement?.success).toBe(true);
+      });
+
+      it('still refuses an asset that is not on the allowlist', async () => {
+        mutable.X402_ALLOWED_ASSETS = 'XLM';
+        httpClient.getPaymentRequiredResponse.mockReturnValue({
+          accepts: [requirement({ asset: EURC_CONTRACT })],
+        });
+        stubPaidServer();
+
+        await expect(buyer().fetch(PAID_URL)).rejects.toThrow(/no compatible payment option/);
+        expect(httpClient.createPaymentPayload).not.toHaveBeenCalled();
+      });
     });
 
     it('releases the reservation when the paid request does not settle', async () => {

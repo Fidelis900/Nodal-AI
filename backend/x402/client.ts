@@ -46,7 +46,7 @@
  * filtered out before the selector runs.
  */
 
-import { xdr } from '@stellar/stellar-sdk';
+import { Asset, xdr } from '@stellar/stellar-sdk';
 import { x402Client, x402HTTPClient } from '@x402/core/client';
 import type { PaymentRequired, PaymentRequirements, SettleResponse } from '@x402/core/types';
 import { ExactStellarScheme } from '@x402/stellar/exact/client';
@@ -59,7 +59,7 @@ import { toCaip2 } from '../network';
 import { spendingTracker } from '../spending_tracker';
 import { PolicyViolationError } from '../errors';
 import type { Signer } from '../signer';
-import { sorobanServer } from '../rpc_client';
+import { resolveNetworkPassphrase, sorobanServer } from '../rpc_client';
 
 const log = createLogger('x402-client');
 
@@ -132,16 +132,13 @@ function allowedAssetContracts(): Set<string> {
   const contracts = new Set<string>([config.X402_ASSET_CONTRACT]);
 
   if (config.X402_ALLOWED_ASSETS) {
+    const networkPassphrase = resolveNetworkPassphrase(config.STELLAR_NETWORK);
     for (const entry of config.X402_ALLOWED_ASSETS.split(',').map((s) => s.trim())) {
-      if (entry === 'XLM') {
-        // Native XLM is allowed; its SAC is already well-known but we'll
-        // accept it via findDefaultAsset matching in selectRequirements.
-        continue;
-      }
-      // entries are "CODE:ISSUER"; contract address is in config for the
-      // primary asset. For additional assets we just store the entry string
-      // and compare by contract in selectRequirements below.
-      contracts.add(entry); // kept as CODE:ISSUER for now; matched at selection time
+      // PaymentRequirements.asset is a SAC contract id (C…), so convert each
+      // "XLM" / "CODE:ISSUER" entry to its Stellar Asset Contract address.
+      const [code = '', issuer] = entry.split(':');
+      const asset = entry === 'XLM' ? Asset.native() : new Asset(code, issuer);
+      contracts.add(asset.contractId(networkPassphrase));
     }
   }
 
@@ -225,8 +222,8 @@ function selectRequirements(
     if (req.scheme !== 'exact') continue;
     if (req.network !== agentNetwork && req.network !== 'stellar:*') continue;
 
-    // req.asset is a SAC contract address (C…) or a CODE:ISSUER entry for
-    // non-default assets listed in X402_ALLOWED_ASSETS.
+    // req.asset is a SAC contract address (C…); `allowed` holds the SAC ids of
+    // the default asset and every asset listed in X402_ALLOWED_ASSETS.
     if (allowed.has(req.asset) || allowed.has(req.asset.toUpperCase())) return req;
 
     // Fallback: accept the default asset contract on this network.
