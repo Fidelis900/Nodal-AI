@@ -67,6 +67,9 @@ const log = createLogger('x402-client');
 /** How many ledgers ahead the auth entry is valid (≈ 50 × 5 s = 250 s). */
 const DEFAULT_AUTH_EXPIRY_LEDGERS = 50;
 
+/** Largest stream request body buffered so it can be replayed on the paid retry. */
+const MAX_BUFFERED_BODY_BYTES = 1024 * 1024;
+
 // ─── Signer adapter ───────────────────────────────────────────────────────────
 
 /**
@@ -230,6 +233,49 @@ function assertPayToAllowed(payTo: string, selfAddress: string): void {
   }
 }
 
+// ─── Request body replay ──────────────────────────────────────────────────────
+
+/**
+ * The probe and the paid retry send the same `init`. A `ReadableStream` body is
+ * consumed by the probe, so it is read into memory up front (capped at
+ * MAX_BUFFERED_BODY_BYTES) and both requests send the buffered bytes. Other
+ * body types (string, Buffer/ArrayBuffer, Blob, FormData, URLSearchParams) are
+ * replayable and passed through unchanged.
+ */
+async function toReplayableInit(init?: RequestInit): Promise<RequestInit | undefined> {
+  const body = init?.body;
+  if (!(body instanceof ReadableStream)) return init;
+
+  const reader = (body as ReadableStream<Uint8Array>).getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    total += value.byteLength;
+    if (total > MAX_BUFFERED_BODY_BYTES) {
+      await reader.cancel();
+      throw new Error(
+        `x402 v2: stream request body exceeds ${MAX_BUFFERED_BODY_BYTES} bytes; ` +
+          `pass a string, Buffer or FormData body instead`
+      );
+    }
+    chunks.push(value);
+  }
+
+  const buffered = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    buffered.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+
+  // `duplex` is only meaningful for stream bodies.
+  const replayable: RequestInit & { duplex?: string } = { ...init, body: buffered };
+  delete replayable.duplex;
+  return replayable;
+}
+
 // ─── Requirement selection ────────────────────────────────────────────────────
 
 /**
@@ -329,13 +375,16 @@ export class X402FetchClient {
    *
    * @param url - Target URL.
    * @param init - Optional RequestInit forwarded to both the probe and paid requests.
+   *   Bodies should be string, Buffer or FormData; a `ReadableStream` body is
+   *   buffered (up to 1 MiB) so the paid retry can resend it.
    * @returns The final response and optional settlement details.
    */
   async fetch(url: string | URL, init?: RequestInit): Promise<X402FetchResult> {
     const urlStr = url instanceof URL ? url.toString() : url;
+    const replayInit = await toReplayableInit(init);
 
     // ── 1. Probe request ─────────────────────────────────────────────────────
-    const probeResponse = await globalThis.fetch(urlStr, init);
+    const probeResponse = await globalThis.fetch(urlStr, replayInit);
 
     if (probeResponse.status !== 402) {
       return { response: probeResponse };
@@ -403,9 +452,9 @@ export class X402FetchClient {
     const paymentHeaders = this.httpClient.encodePaymentSignatureHeader(paymentPayload);
 
     const paidResponse = await globalThis.fetch(urlStr, {
-      ...init,
+      ...replayInit,
       headers: {
-        ...(init?.headers as Record<string, string> | undefined),
+        ...(replayInit?.headers as Record<string, string> | undefined),
         ...paymentHeaders,
       },
     });

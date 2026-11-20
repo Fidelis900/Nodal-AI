@@ -392,6 +392,31 @@ describe('x402 v2 Interoperability', () => {
       expect(spendingTracker.total()).toBe(0);
     });
 
+    // #926: a stream body is consumed by the probe, so it must be buffered.
+    it('pays a POST with a stream body and delivers the body on the paid retry', async () => {
+      const fetchMock = stubPaidServer();
+      const body = new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(new TextEncoder().encode('{"query":'));
+          controller.enqueue(new TextEncoder().encode('"weather"}'));
+          controller.close();
+        },
+      });
+
+      const { response } = await buyer().fetch(PAID_URL, {
+        method: 'POST',
+        body,
+        duplex: 'half',
+      } as RequestInit);
+
+      expect(response.status).toBe(200);
+      const decode = (b: unknown): string => new TextDecoder().decode(b as Uint8Array);
+      expect(decode(fetchMock.mock.calls[0]![1].body)).toBe('{"query":"weather"}');
+      expect(decode(fetchMock.mock.calls[1]![1].body)).toBe('{"query":"weather"}');
+      expect(fetchMock.mock.calls[1]![1].method).toBe('POST');
+      expect(spendingTracker.total()).toBeCloseTo(1.5);
+    });
+
     // #921: the reservation is keyed by the asset actually paid.
     it('reserves a payment in another allowed asset under that asset key', async () => {
       httpClient.getPaymentRequiredResponse.mockReturnValue({
