@@ -54,6 +54,7 @@ import type { ClientStellarSigner, RpcConfig } from '@x402/stellar';
 
 import { config, MAINNET_SPENDING_CAP } from '../config';
 import { createLogger } from '../utils/logger';
+import { fromStroops, toStroops, tryToStroops } from '../utils/amount';
 import { toCaip2 } from '../network';
 import { spendingTracker } from '../spending_tracker';
 import { PolicyViolationError } from '../errors';
@@ -148,27 +149,38 @@ function allowedAssetContracts(): Set<string> {
 }
 
 /**
- * Guard the amount from a PaymentRequirements against AGENT_SPENDING_LIMIT and
- * the mainnet hard cap. Throws with a clear message if either is exceeded.
+ * Convert a PaymentRequirements amount to stroops. In x402 v2 `amount` is in
+ * the token's smallest unit; the payable assets are Stellar Asset Contracts
+ * wrapping classic assets, which always use 7 decimals, so one atomic unit is
+ * exactly one stroop (0.01 USDC is "100000").
  */
-function assertAmountWithinLimits(amount: string): void {
-  const parsed = parseFloat(amount);
-  if (isNaN(parsed)) throw new Error(`x402 v2: invalid payment amount "${amount}"`);
+function atomicAmountToStroops(amount: string): bigint {
+  if (!/^\d+$/.test(amount)) throw new Error(`x402 v2: invalid payment amount "${amount}"`);
+  return BigInt(amount);
+}
 
-  const limit = parseFloat(config.AGENT_SPENDING_LIMIT);
-  if (!isNaN(limit) && parsed > limit) {
+/**
+ * Guard the amount (in stroops) from a PaymentRequirements against
+ * AGENT_SPENDING_LIMIT, the mainnet hard cap and X402_MAX_PRICE, which are all
+ * decimal amounts. Throws with a clear message if any is exceeded.
+ */
+function assertAmountWithinLimits(stroops: bigint): void {
+  const amount = fromStroops(stroops);
+
+  const limit = tryToStroops(config.AGENT_SPENDING_LIMIT);
+  if (limit !== null && stroops > limit) {
     throw new Error(
       `x402 v2: amount ${amount} exceeds AGENT_SPENDING_LIMIT of ${config.AGENT_SPENDING_LIMIT}`
     );
   }
 
-  if (config.STELLAR_NETWORK === 'mainnet' && parsed > MAINNET_SPENDING_CAP) {
+  if (config.STELLAR_NETWORK === 'mainnet' && stroops > toStroops(String(MAINNET_SPENDING_CAP))) {
     throw new Error(
       `x402 v2: amount ${amount} exceeds mainnet spending cap of ${MAINNET_SPENDING_CAP}`
     );
   }
 
-  if (config.X402_MAX_PRICE && parsed > parseFloat(config.X402_MAX_PRICE)) {
+  if (config.X402_MAX_PRICE && stroops > toStroops(config.X402_MAX_PRICE)) {
     throw new Error(`x402 v2: amount ${amount} exceeds X402_MAX_PRICE of ${config.X402_MAX_PRICE}`);
   }
 }
@@ -335,7 +347,8 @@ export class X402FetchClient {
     }
 
     // ── 4. Pre-payment guards (before reserving or signing) ──────────────────
-    assertAmountWithinLimits(chosen.amount);
+    const amountStroops = atomicAmountToStroops(chosen.amount);
+    assertAmountWithinLimits(amountStroops);
     assertPayToAllowed(chosen.payTo, this.agentAddress);
 
     if (config.ALLOWED_X402_ORIGINS) {
@@ -347,7 +360,7 @@ export class X402FetchClient {
     }
 
     // ── 5. Reserve spend ─────────────────────────────────────────────────────
-    const reservationId = spendingTracker.reserve(chosen.amount);
+    const reservationId = spendingTracker.reserve(fromStroops(amountStroops));
 
     let paymentPayload;
     try {
