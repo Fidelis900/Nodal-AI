@@ -197,6 +197,51 @@ function assertPayToAllowed(payTo: string, selfAddress: string): void {
   }
 }
 
+/** Hosts allowed over plain HTTP outside mainnet (local development). */
+const LOCALHOST_HOSTNAMES = new Set(['localhost', '127.0.0.1', '[::1]']);
+
+/**
+ * Normalise an ALLOWED_X402_ORIGINS entry to a full origin
+ * (`scheme://host[:port]`). Bare hostnames mean the default HTTPS origin.
+ */
+function normalizeOrigin(entry: string): string {
+  const withScheme = entry.includes('://') ? entry : `https://${entry}`;
+  try {
+    return new URL(withScheme).origin;
+  } catch {
+    return entry;
+  }
+}
+
+/**
+ * Guard the resource URL before any request is made: it must be HTTPS (plain
+ * HTTP only for localhost off mainnet) and, when ALLOWED_X402_ORIGINS is set,
+ * its full origin (scheme, host and port) must be listed.
+ */
+function assertOriginAllowed(url: URL): void {
+  if (url.protocol !== 'https:') {
+    const devLocalhost =
+      url.protocol === 'http:' &&
+      LOCALHOST_HOSTNAMES.has(url.hostname) &&
+      config.STELLAR_NETWORK !== 'mainnet';
+    if (!devLocalhost) {
+      throw new Error(`x402 v2: refusing non-HTTPS resource origin: ${url.origin}`);
+    }
+  }
+
+  if (config.ALLOWED_X402_ORIGINS) {
+    const allowedOrigins = new Set(
+      config.ALLOWED_X402_ORIGINS.split(',')
+        .map((o) => o.trim())
+        .filter((o) => o.length > 0)
+        .map(normalizeOrigin)
+    );
+    if (!allowedOrigins.has(url.origin)) {
+      throw new Error(`x402 v2: untrusted resource origin: ${url.origin}`);
+    }
+  }
+}
+
 // ─── Requirement selection ────────────────────────────────────────────────────
 
 /**
@@ -301,6 +346,9 @@ export class X402FetchClient {
   async fetch(url: string | URL, init?: RequestInit): Promise<X402FetchResult> {
     const urlStr = url instanceof URL ? url.toString() : url;
 
+    // ── 0. Origin guard (before any request leaves the agent) ────────────────
+    assertOriginAllowed(new URL(urlStr));
+
     // ── 1. Probe request ─────────────────────────────────────────────────────
     const probeResponse = await globalThis.fetch(urlStr, init);
 
@@ -341,14 +389,6 @@ export class X402FetchClient {
     assertAmountWithinLimits(chosen.amount);
     assertPayToAllowed(chosen.payTo, this.agentAddress);
 
-    if (config.ALLOWED_X402_ORIGINS) {
-      const allowedOrigins = new Set(config.ALLOWED_X402_ORIGINS.split(',').map((o) => o.trim()));
-      const hostname = new URL(urlStr).hostname;
-      if (!allowedOrigins.has(hostname)) {
-        throw new Error(`x402 v2: untrusted resource origin: ${hostname}`);
-      }
-    }
-
     // ── 5. Reserve spend ─────────────────────────────────────────────────────
     const reservationId = spendingTracker.reserve(chosen.amount);
 
@@ -371,6 +411,9 @@ export class X402FetchClient {
 
     const paidResponse = await globalThis.fetch(urlStr, {
       ...init,
+      // Never follow a redirect with the payment header attached: it could
+      // forward the signed payment to another origin.
+      redirect: 'manual',
       headers: {
         ...(init?.headers as Record<string, string> | undefined),
         ...paymentHeaders,

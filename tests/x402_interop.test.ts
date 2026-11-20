@@ -409,6 +409,81 @@ describe('x402 v2 Interoperability', () => {
       expect(fetchMock).toHaveBeenCalledTimes(1);
     });
 
+    describe('resource origin guard (#925)', () => {
+      const mutable = config as unknown as {
+        ALLOWED_X402_ORIGINS: string | undefined;
+        STELLAR_NETWORK: string;
+      };
+
+      afterEach(() => {
+        mutable.ALLOWED_X402_ORIGINS = undefined;
+        mutable.STELLAR_NETWORK = 'testnet';
+      });
+
+      it('makes no request to an origin outside ALLOWED_X402_ORIGINS', async () => {
+        mutable.ALLOWED_X402_ORIGINS = 'https://trusted.example.com';
+        const fetchMock = stubPaidServer();
+
+        await expect(buyer().fetch(PAID_URL)).rejects.toThrow(/untrusted resource origin/);
+
+        expect(fetchMock).not.toHaveBeenCalled();
+        expect(spendingTracker.total()).toBe(0);
+      });
+
+      it('compares the full origin, so another port on an allowed host is rejected', async () => {
+        mutable.ALLOWED_X402_ORIGINS = 'api.example.com';
+        const fetchMock = stubPaidServer();
+
+        await expect(buyer().fetch('https://api.example.com:8443/data')).rejects.toThrow(
+          /untrusted resource origin/
+        );
+        expect(fetchMock).not.toHaveBeenCalled();
+      });
+
+      it('accepts a URL whose origin is listed', async () => {
+        mutable.ALLOWED_X402_ORIGINS = 'https://api.example.com';
+        stubPaidServer();
+
+        const { response } = await buyer().fetch(PAID_URL);
+
+        expect(response.status).toBe(200);
+      });
+
+      it('rejects a plain-HTTP origin on mainnet, even localhost', async () => {
+        mutable.STELLAR_NETWORK = 'mainnet';
+        const fetchMock = stubPaidServer();
+
+        await expect(buyer().fetch('http://api.example.com/data')).rejects.toThrow(/non-HTTPS/);
+        await expect(buyer().fetch('http://localhost:4021/data')).rejects.toThrow(/non-HTTPS/);
+        expect(fetchMock).not.toHaveBeenCalled();
+      });
+
+      it('rejects a plain-HTTP origin other than localhost off mainnet', async () => {
+        const fetchMock = stubPaidServer();
+
+        await expect(buyer().fetch('http://api.example.com/data')).rejects.toThrow(/non-HTTPS/);
+        expect(fetchMock).not.toHaveBeenCalled();
+      });
+
+      it('does not follow a redirect with the payment header attached', async () => {
+        httpClient.processPaymentResult.mockRejectedValue(new Error('no settlement header'));
+        const fetchMock = vi
+          .fn()
+          .mockResolvedValueOnce(new Response('{}', { status: 402 }))
+          .mockResolvedValueOnce(
+            new Response(null, { status: 302, headers: { Location: 'https://evil.example.com/' } })
+          );
+        vi.stubGlobal('fetch', fetchMock);
+
+        const { response } = await buyer().fetch(PAID_URL);
+
+        expect(fetchMock.mock.calls[1]![1].redirect).toBe('manual');
+        expect(fetchMock).toHaveBeenCalledTimes(2);
+        expect(response.status).toBe(302);
+        expect(spendingTracker.total()).toBe(0);
+      });
+    });
+
     it('needs no facilitator: settlement is the seller side of the protocol', async () => {
       const mutable = config as unknown as { X402_FACILITATOR_URL: string | undefined };
       const original = mutable.X402_FACILITATOR_URL;
