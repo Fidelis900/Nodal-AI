@@ -6,7 +6,7 @@
  */
 
 import { createHash, timingSafeEqual } from 'crypto';
-import { PayFiAgent, VALUE_MOVING_TASK_TYPES } from '../agent';
+import { PayFiAgent } from '../agent';
 import { config } from '../config';
 import { createLogger } from '../utils/logger';
 
@@ -38,7 +38,7 @@ export interface MCPResponse {
  * Read-only tools exposed by default; value-moving require MCP_ALLOW_PAYMENTS.
  */
 function getMCPTools(agent: PayFiAgent): MCPTool[] {
-  const allowPayments = process.env.MCP_ALLOW_PAYMENTS === 'true';
+  const allowPayments = config.MCP_ALLOW_PAYMENTS;
 
   return agent
     .getTools()
@@ -103,10 +103,6 @@ async function handleRequest(agent: PayFiAgent, request: MCPRequest): Promise<MC
             id,
             error: { code: -32601, message: `Tool not found: ${toolName}` },
           };
-        }
-
-        if (tool.valueMoving && !VALUE_MOVING_TASK_TYPES.has(toolName as any)) {
-          // Additional check handled by filter
         }
 
         const result = await agent.run({ type: toolName, payload: args });
