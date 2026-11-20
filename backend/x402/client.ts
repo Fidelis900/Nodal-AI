@@ -46,7 +46,7 @@
  * filtered out before the selector runs.
  */
 
-import { xdr } from '@stellar/stellar-sdk';
+import { Asset, Networks, xdr } from '@stellar/stellar-sdk';
 import { x402Client, x402HTTPClient } from '@x402/core/client';
 import type { PaymentRequired, PaymentRequirements, SettleResponse } from '@x402/core/types';
 import { ExactStellarScheme } from '@x402/stellar/exact/client';
@@ -55,7 +55,7 @@ import type { ClientStellarSigner, RpcConfig } from '@x402/stellar';
 import { config, MAINNET_SPENDING_CAP } from '../config';
 import { createLogger } from '../utils/logger';
 import { toCaip2 } from '../network';
-import { spendingTracker } from '../spending_tracker';
+import { assetKey, spendingTracker } from '../spending_tracker';
 import { PolicyViolationError } from '../errors';
 import type { Signer } from '../signer';
 import { sorobanServer } from '../rpc_client';
@@ -145,6 +145,42 @@ function allowedAssetContracts(): Set<string> {
   }
 
   return contracts;
+}
+
+/**
+ * Map the SAC contract address a requirement pays in (`req.asset`) back to the
+ * spending tracker's canonical asset key (`CODE:ISSUER` or `XLM`), so per-asset
+ * SPENDING_LIMITS apply to the asset actually paid. The default x402 asset and
+ * every `X402_ALLOWED_ASSETS` entry are recognised; anything else is keyed by
+ * the contract address itself, which SPENDING_LIMITS_ALLOW_UNKNOWN then governs.
+ */
+function assetKeyForRequirement(asset: string): string {
+  if (asset === config.X402_ASSET_CONTRACT) {
+    return assetKey(config.X402_ASSET_CODE, config.X402_ASSET_ISSUER);
+  }
+  if (asset.toUpperCase() === 'XLM') return 'XLM';
+  if (asset.includes(':')) {
+    const [code, issuer] = asset.split(':');
+    return assetKey(code!, issuer);
+  }
+
+  const networkPassphrase = {
+    testnet: Networks.TESTNET,
+    mainnet: Networks.PUBLIC,
+    futurenet: Networks.FUTURENET,
+  }[config.STELLAR_NETWORK];
+
+  if (config.X402_ALLOWED_ASSETS) {
+    for (const entry of config.X402_ALLOWED_ASSETS.split(',').map((s) => s.trim())) {
+      const [code, issuer] = entry.split(':');
+      const sac = entry === 'XLM' ? Asset.native() : new Asset(code!, issuer);
+      if (sac.contractId(networkPassphrase) === asset) {
+        return entry === 'XLM' ? 'XLM' : assetKey(code!, issuer);
+      }
+    }
+  }
+
+  return asset;
 }
 
 /**
@@ -347,7 +383,10 @@ export class X402FetchClient {
     }
 
     // ── 5. Reserve spend ─────────────────────────────────────────────────────
-    const reservationId = spendingTracker.reserve(chosen.amount);
+    const reservationId = spendingTracker.reserve(
+      chosen.amount,
+      assetKeyForRequirement(chosen.asset)
+    );
 
     let paymentPayload;
     try {
