@@ -14,7 +14,8 @@
  *   6. Guard the amount against AGENT_SPENDING_LIMIT.
  *   7. Reserve the spend, sign the SAC auth entry, encode the PAYMENT header.
  *   8. Retry the request with the payment header.
- *   9. On confirmed settlement (200 + PAYMENT-RESPONSE) → commit the spend.
+ *   9. On confirmed settlement (successful PAYMENT-RESPONSE or a settlement tx
+ *      hash, whatever the HTTP status) → commit the spend.
  *   10. On any failure → release the reservation.
  *
  * ## Design decisions
@@ -472,7 +473,9 @@ export class X402FetchClient {
       // processPaymentResult failing is non-fatal; we already have the response.
     }
 
-    const settled = paidResponse.status === 200 && settlement?.success === true;
+    // Funds leave once the facilitator settles, even if the resource server
+    // then errors, so commit on settlement independent of the HTTP status.
+    const settled = settlement?.success === true || !!settlement?.transaction;
 
     if (settled) {
       spendingTracker.commit(reservationId);
@@ -480,6 +483,12 @@ export class X402FetchClient {
         { url: urlStr, amount: chosen.amount, asset: chosen.asset, network: chosen.network },
         'x402 v2 payment settled'
       );
+      if (paidResponse.status !== 200) {
+        log.warn(
+          { url: urlStr, status: paidResponse.status, transaction: settlement?.transaction },
+          'x402 v2 payment settled but the paid request did not return 200; spend committed'
+        );
+      }
     } else {
       spendingTracker.release(reservationId);
       if (paidResponse.status !== 200) {

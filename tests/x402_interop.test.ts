@@ -383,6 +383,28 @@ describe('x402 v2 Interoperability', () => {
       expect(spendingTracker.total()).toBe(0);
     });
 
+    // #924: settlement, not the HTTP status, decides whether money left.
+    it('commits the spend when settlement succeeded but the server returned 500', async () => {
+      httpClient.processPaymentResult.mockResolvedValue({
+        settleResponse: { success: true, transaction: 'abc123' },
+      });
+      stubPaidServer(500);
+
+      const { response } = await buyer().fetch(PAID_URL);
+
+      expect(response.status).toBe(500);
+      expect(spendingTracker.total()).toBeCloseTo(1.5);
+    });
+
+    it('releases the reservation when no settlement is reported', async () => {
+      httpClient.processPaymentResult.mockResolvedValue({ settleResponse: undefined });
+      stubPaidServer(200);
+
+      await buyer().fetch(PAID_URL);
+
+      expect(spendingTracker.total()).toBe(0);
+    });
+
     it('releases the reservation when signing fails', async () => {
       httpClient.createPaymentPayload.mockRejectedValue(new Error('signer offline'));
       stubPaidServer();
