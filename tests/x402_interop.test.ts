@@ -19,6 +19,8 @@ import { _setDb } from '../backend/persistence';
 import { spendingTracker } from '../backend/spending_tracker';
 import { x402RateLimiter } from '../backend/x402_rate_limiter';
 import type { Signer } from '../backend/signer';
+import { RpcUnavailableError } from '../backend/errors';
+import { sorobanServer } from '../backend/rpc_client';
 
 // ─── Mock dependencies ────────────────────────────────────────────────────────
 
@@ -99,6 +101,7 @@ vi.mock('../backend/signer', () => ({
 vi.mock('../backend/rpc_client', async (importOriginal) => ({
   ...(await importOriginal<object>()),
   withRetry: (fn: () => Promise<unknown>) => fn(),
+  sorobanServer: { getLatestLedger: vi.fn() },
   horizonServer: {
     ledgers: vi.fn().mockReturnValue({
       ledger: vi.fn().mockReturnValue({
@@ -129,7 +132,11 @@ vi.mock('../backend/tools/StellarPaymentTool', async (importOriginal) => ({
 
 // The seam X402FetchClient talks through: signing and header encoding belong to
 // the x402 packages, the guards and the spend accounting under test are ours.
-const { httpClient } = vi.hoisted(() => ({
+const { httpClient, stellarSigners } = vi.hoisted(() => ({
+  // Signer adapters handed to ExactStellarScheme, one per X402FetchClient.
+  stellarSigners: [] as Array<{
+    signAuthEntry: (entryXdr: string, opts: { networkPassphrase: string }) => Promise<string>;
+  }>,
   httpClient: {
     getPaymentRequiredResponse: vi.fn(),
     createPaymentPayload: vi.fn(),
@@ -152,7 +159,11 @@ vi.mock('@x402/core/client', () => ({
 }));
 
 vi.mock('@x402/stellar/exact/client', () => ({
-  ExactStellarScheme: class {},
+  ExactStellarScheme: class {
+    constructor(signer: (typeof stellarSigners)[number]) {
+      stellarSigners.push(signer);
+    }
+  },
 }));
 
 // ─── Helper functions ─────────────────────────────────────────────────────────
@@ -371,6 +382,31 @@ describe('x402 v2 Interoperability', () => {
       await expect(buyer().fetch(PAID_URL)).rejects.toThrow(/failed to create payment payload/);
 
       expect(spendingTracker.total()).toBe(0);
+    });
+
+    it('signs nothing and throws RpcUnavailableError when Soroban RPC is unreachable (#923)', async () => {
+      vi.mocked(sorobanServer.getLatestLedger).mockRejectedValue(new Error('ECONNREFUSED'));
+      const signAuthEntry = vi.fn();
+      stellarSigners.length = 0;
+      new X402FetchClient({
+        publicKey: () => AGENT_ADDRESS,
+        signAuthEntry,
+      } as unknown as Signer);
+
+      await expect(
+        stellarSigners[0]!.signAuthEntry('AAAA', { networkPassphrase: 'Test' })
+      ).rejects.toBeInstanceOf(RpcUnavailableError);
+      expect(signAuthEntry).not.toHaveBeenCalled();
+    });
+
+    it('passes RpcUnavailableError to the caller and releases the reservation (#923)', async () => {
+      httpClient.createPaymentPayload.mockRejectedValue(new RpcUnavailableError('rpc down'));
+      const fetchMock = stubPaidServer();
+
+      await expect(buyer().fetch(PAID_URL)).rejects.toBeInstanceOf(RpcUnavailableError);
+
+      expect(spendingTracker.total()).toBe(0);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
     });
 
     it('needs no facilitator: settlement is the seller side of the protocol', async () => {
