@@ -77,7 +77,10 @@ function toolToMCPSchema(tool: MCPTool): object {
 /**
  * Handle MCP request and return response.
  */
-async function handleRequest(agent: PayFiAgent, request: MCPRequest): Promise<MCPResponse> {
+export async function handleRequest(
+  agent: PayFiAgent,
+  request: MCPRequest
+): Promise<MCPResponse> {
   const { id } = request;
 
   try {
@@ -229,8 +232,9 @@ export async function startMCPServer(agent: PayFiAgent): Promise<void> {
  * Start MCP server over HTTP.
  */
 import express from 'express';
+import type { Server } from 'http';
 
-export function startMCPHTTPServer(agent: PayFiAgent, port = 3001): void {
+export function startMCPHTTPServer(agent: PayFiAgent, port = 3001): Server {
   const app = express();
   app.use(express.json());
 
@@ -244,5 +248,5 @@ export function startMCPHTTPServer(agent: PayFiAgent, port = 3001): void {
     res.json({ tools: tools.map(toolToMCPSchema) });
   });
 
-  app.listen(port, () => log.info({ port }, 'MCP HTTP server started'));
+  return app.listen(port, () => log.info({ port }, 'MCP HTTP server started'));
 }
