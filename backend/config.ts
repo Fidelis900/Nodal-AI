@@ -187,6 +187,20 @@ const EnvSchema = z.object({
   // Health check HTTP server
   HEALTH_PORT: z.coerce.number().int().min(1).max(65535).default(3000),
 
+  /**
+   * Payments above this amount (in the agent's asset) are held for human
+   * approval before execution rather than submitted immediately.
+   * "0" disables the threshold (all tasks execute immediately).
+   * Defaults to "0" (threshold disabled).
+   */
+  APPROVAL_THRESHOLD: z
+    .string()
+    .regex(
+      /^\d+(\.\d{1,7})?$/,
+      "APPROVAL_THRESHOLD must be a non-negative decimal (e.g. '50' or '0')"
+    )
+    .default("0"),
+
   // Webhook notifications
   WEBHOOK_URL: z.string().url().optional(),
   WEBHOOK_SECRET: z.string().min(1).optional(),
@@ -337,6 +351,12 @@ export interface AgentConfig {
   readonly HEALTH_PORT: number;
   readonly WEBHOOK_URL?: string | undefined;
   readonly WEBHOOK_SECRET?: string | undefined;
+  /**
+   * Payments above this amount are held for human approval before execution.
+   * "0" means threshold is disabled — all tasks execute immediately.
+   * Defaults to "0".
+   */
+  readonly APPROVAL_THRESHOLD: string;
 }
 
 // ─── Loader ───────────────────────────────────────────────────────────────────
@@ -431,6 +451,7 @@ function parseConfigAndDerive(): AgentConfig {
     OTLP_ENDPOINT,
     WEBHOOK_URL,
     WEBHOOK_SECRET,
+    APPROVAL_THRESHOLD,
     ...rest
   } = raw;
 
@@ -448,6 +469,7 @@ function parseConfigAndDerive(): AgentConfig {
     RPC_TIMEOUT_MS: rpcTimeoutMs,
     MAX_X402_PAYMENTS_PER_MINUTE: raw.MAX_X402_PAYMENTS_PER_MINUTE,
     MAX_SOROBAN_FEE_STROOPS: raw.MAX_SOROBAN_FEE_STROOPS,
+    APPROVAL_THRESHOLD,
     ...(ALLOWED_X402_ORIGINS && { ALLOWED_X402_ORIGINS }),
     ...(AGENT_SECRET_KEY_ARN && { AGENT_SECRET_KEY_ARN }),
     ...(OTLP_ENDPOINT && { OTLP_ENDPOINT }),

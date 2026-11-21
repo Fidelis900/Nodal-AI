@@ -35,9 +35,54 @@ import { horizonServer } from "./rpc_client";
 import { createLogger, generateCorrelationId } from "./utils/logger";
 import { SpendingTracker } from "./spending_tracker";
 import { dispatchWebhook } from "./webhook";
+import { approvalStore } from "./approval_store";
 
 // Instantiate a singleton tracker
 export const spendingTracker = new SpendingTracker();
+
+// ─── Approval threshold helper ────────────────────────────────────────────────
+
+/**
+ * Extract the numeric payment amount from a task payload.
+ * Returns NaN when no recognised amount field is present.
+ */
+function extractPaymentAmount(task: AgentTask): number {
+  const p = task.payload as Record<string, unknown>;
+  // Most payment tools use "amount"; path_payment uses "sendAmount";
+  // batch_payment sums individual amounts.
+  if (task.type === "batch_payment") {
+    const payments = Array.isArray(p?.payments) ? p.payments : [];
+    return payments.reduce((sum: number, pay: unknown) => {
+      const amt = parseFloat((pay as Record<string, unknown>)?.amount as string);
+      return sum + (isNaN(amt) ? 0 : amt);
+    }, 0);
+  }
+  if (task.type === "path_payment") return parseFloat(p?.sendAmount as string);
+  return parseFloat(p?.amount as string);
+}
+
+/**
+ * Returns true when the task payload's amount exceeds the configured
+ * `APPROVAL_THRESHOLD` and that threshold is non-zero.
+ */
+function requiresApproval(task: AgentTask): boolean {
+  const threshold = parseFloat(config.APPROVAL_THRESHOLD);
+  if (isNaN(threshold) || threshold <= 0) return false;
+
+  // Only payment-moving task types are subject to approval.
+  const guarded: AgentTask["type"][] = [
+    "stellar_payment",
+    "x402_respond",
+    "multisig_payment",
+    "batch_payment",
+    "path_payment",
+    "dex_offer",
+  ];
+  if (!guarded.includes(task.type)) return false;
+
+  const amount = extractPaymentAmount(task);
+  return !isNaN(amount) && amount > threshold;
+}
 
 // ─── Spending limit guard ─────────────────────────────────────────────────────
 
@@ -143,6 +188,16 @@ export interface AgentResult {
    * unless the caller supplies one on the task.
    */
   correlationId?: string;
+  /**
+   * When the task requires human approval before execution, this field is set
+   * to the approval ID returned by the approval store.  The task has NOT been
+   * submitted; call `POST /approvals/:id` to approve or deny it.
+   */
+  approvalId?: string;
+  /**
+   * Set to true when the task was held for human approval rather than executed.
+   */
+  pendingApproval?: boolean;
 }
 
 // ─── Payload sanitisation ─────────────────────────────────────────────────────
@@ -345,11 +400,34 @@ export class PayFiAgent extends EventEmitter {
     logger.info("Agent destroyed — all event listeners removed");
   }
 
+  /**
+   * Execute a previously held task after an operator approves it.
+   *
+   * Calls `approvalStore.approve(id)` (which throws on unknown /
+   * already-processed / expired IDs), then re-dispatches the original task
+   * through `run()` while bypassing the approval gate for this specific call.
+   */
+  async executeApproved(approvalId: string): Promise<AgentResult> {
+    const entry = approvalStore.approve(approvalId);
+    this._preApprovedIds.add(approvalId);
+    try {
+      return await this.run({
+        ...entry.task,
+        // Carry original correlationId so logs are linkable to the held result
+        correlationId: entry.task.correlationId ?? `approved:${approvalId}`,
+      });
+    } finally {
+      this._preApprovedIds.delete(approvalId);
+    }
+  }
+
+  /** Approval IDs currently executing — these bypass the threshold gate. */
+  private readonly _preApprovedIds = new Set<string>();
+
   drain(): void {
     this.isDraining = true;
     logger.info("Agent draining — rejecting new tasks");
   }
-
   async waitForPendingTasks(): Promise<void> {
     if (this.activeTasks === 0) return;
     logger.info("Waiting for pending tasks to finish", { activeTasks: this.activeTasks });
@@ -423,6 +501,31 @@ export class PayFiAgent extends EventEmitter {
     this.activeTasks++;
     taskLog.info({ taskType: task.type }, "Running task");
     try {
+      // ── Approval gate: hold tasks that exceed APPROVAL_THRESHOLD ──────────
+      // Pre-approved tasks (from executeApproved()) skip this gate.
+      const isPreApproved =
+        correlationId.startsWith("approved:") ||
+        this._preApprovedIds.has(correlationId.replace("approved:", ""));
+      if (!isPreApproved && requiresApproval(task)) {        this.activeTasks--;
+        const approvalId = approvalStore.hold(task);
+        taskLog.info(
+          { taskType: task.type, approvalId },
+          "Task held for approval — amount exceeds APPROVAL_THRESHOLD"
+        );
+        const heldResult: AgentResult = {
+          success: false,
+          taskType: task.type,
+          pendingApproval: true,
+          approvalId,
+          correlationId,
+          error: `Task requires human approval (id: ${approvalId})`,
+        };
+        this.emit("task:held", heldResult);
+        saveResult({ ...heldResult, timestamp: new Date().toISOString() });
+        void dispatchWebhook(heldResult);
+        return heldResult;
+      }
+
       let data: unknown;
 
       switch (task.type) {

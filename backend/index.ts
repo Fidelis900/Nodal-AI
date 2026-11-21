@@ -68,7 +68,7 @@ async function start() {
   initTelemetry();
 
   agent = new PayFiAgent();
-  healthServer = startHealthServer();
+  healthServer = startHealthServer(agent);
 
   process.on("SIGTERM", () => shutdown("SIGTERM"));
   process.on("SIGINT",  () => shutdown("SIGINT"));

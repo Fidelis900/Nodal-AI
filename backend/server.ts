@@ -18,6 +18,8 @@ import { horizonServer, sorobanServer } from "./rpc_client";
 import { db } from "./db/client";
 import { handleError } from "./middleware/error_handler";
 import { createLogger } from "./utils/logger";
+import { approvalStore } from "./approval_store";
+import type { PayFiAgent } from "./agent";
 
 const log = createLogger("health-server");
 
@@ -113,13 +115,18 @@ function isAuthenticated(req: http.IncomingMessage): boolean {
 
 const HEALTH_PATH = "/health";
 const STATUS_PATH = "/status";
+const APPROVALS_PATH = "/approvals";
+const APPROVALS_ID_RE = /^\/approvals\/([^/?#]+)$/;
 
 /**
  * Creates and returns the health-check HTTP server.
  * Does NOT call `.listen()` — the caller (typically `index.ts`) is responsible
  * for binding to `config.HEALTH_PORT`.
+ *
+ * @param agent - Optional PayFiAgent instance. When provided, the server also
+ *   exposes `GET /approvals` and `POST /approvals/:id` for the approval flow.
  */
-export function createHealthServer(): http.Server {
+export function createHealthServer(agent?: PayFiAgent): http.Server {
   const server = http.createServer((req, res) => {
     // ── GET /health ────────────────────────────────────────────────────────
     if (req.method === "GET" && req.url === HEALTH_PATH) {
@@ -161,6 +168,40 @@ export function createHealthServer(): http.Server {
       return;
     }
 
+    // ── GET /approvals ─────────────────────────────────────────────────────
+    if (req.method === "GET" && req.url === APPROVALS_PATH) {
+      if (!isAuthenticated(req)) {
+        res.writeHead(401, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "Unauthorized" }));
+        return;
+      }
+      const list = approvalStore.list();
+      const body = JSON.stringify({ approvals: list });
+      res.writeHead(200, {
+        "Content-Type": "application/json",
+        "Content-Length": Buffer.byteLength(body),
+      });
+      res.end(body);
+      return;
+    }
+
+    // ── POST /approvals/:id ────────────────────────────────────────────────
+    const approvalMatch = req.url ? APPROVALS_ID_RE.exec(req.url) : null;
+    if (req.method === "POST" && approvalMatch) {
+      if (!isAuthenticated(req)) {
+        res.writeHead(401, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "Unauthorized" }));
+        return;
+      }
+      if (!agent) {
+        res.writeHead(503, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "Agent not available" }));
+        return;
+      }
+      handleApprovalAction(req, res, approvalMatch[1]!, agent);
+      return;
+    }
+
     // ── 404 for everything else ────────────────────────────────────────────
     res.writeHead(404, { "Content-Type": "application/json" });
     res.end(JSON.stringify({ error: "Not Found" }));
@@ -173,8 +214,8 @@ export function createHealthServer(): http.Server {
  * Convenience: create the server and immediately start listening.
  * Returns the bound server instance.
  */
-export function startHealthServer(): http.Server {
-  const server = createHealthServer();
+export function startHealthServer(agent?: PayFiAgent): http.Server {
+  const server = createHealthServer(agent);
   const port = config.HEALTH_PORT;
 
   server.listen(port, () => {
@@ -264,4 +305,85 @@ async function handleResults(
     });
     res.end(payload);
   }
+}
+
+/**
+ * Handle POST /approvals/:id
+ *
+ * Body JSON: `{ "action": "approve" | "deny" }`
+ *
+ * - approve → calls agent.executeApproved(id), returns the AgentResult
+ * - deny    → calls approvalStore.deny(id), returns the updated entry
+ *
+ * Both paths are idempotent-safe: attempting to approve/deny an already-
+ * processed entry returns 409 Conflict.
+ */
+function handleApprovalAction(
+  req: http.IncomingMessage,
+  res: http.ServerResponse,
+  id: string,
+  agent: PayFiAgent
+): void {
+  let body = "";
+  req.on("data", (chunk: Buffer | string) => {
+    body += chunk.toString();
+  });
+  req.on("end", () => {
+    void (async () => {
+      try {
+        let parsed: { action?: string };
+        try {
+          parsed = JSON.parse(body || "{}");
+        } catch {
+          res.writeHead(400, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "Invalid JSON body" }));
+          return;
+        }
+
+        const action = parsed.action;
+        if (action !== "approve" && action !== "deny") {
+          res.writeHead(400, { "Content-Type": "application/json" });
+          res.end(
+            JSON.stringify({ error: 'body must contain { "action": "approve" | "deny" }' })
+          );
+          return;
+        }
+
+        if (action === "deny") {
+          const entry = approvalStore.deny(id);
+          const payload = JSON.stringify({ approval: entry });
+          res.writeHead(200, {
+            "Content-Type": "application/json",
+            "Content-Length": Buffer.byteLength(payload),
+          });
+          res.end(payload);
+          return;
+        }
+
+        // action === "approve"
+        const result = await agent.executeApproved(id);
+        const payload = JSON.stringify({ result });
+        res.writeHead(200, {
+          "Content-Type": "application/json",
+          "Content-Length": Buffer.byteLength(payload),
+        });
+        res.end(payload);
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        // Distinguish "not found / wrong state" (409) from actual failures (500)
+        const isConflict =
+          message.includes("already") ||
+          message.includes("not found") ||
+          message.includes("expired");
+        const statusCode = isConflict ? 409 : 500;
+        log.error({ msg: "Approval action failed", id, error: message });
+        const payload = JSON.stringify({ error: message });
+        res.writeHead(statusCode, {
+          "Content-Type": "application/json",
+          "Content-Length": Buffer.byteLength(payload),
+        });
+        res.end(payload);
+      }
+    })();
+  });
 }
