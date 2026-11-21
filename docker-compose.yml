@@ -246,20 +246,17 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-      target: node-builder
+      target: dashboard         # production build served by nginx (#970)
     container_name: nodal-dashboard
     profiles:
       - dashboard               # only starts with: docker compose --profile dashboard up
     depends_on:
       agent:
         condition: service_healthy
-    environment:
-      VITE_API_URL: http://agent:3000
-      VITE_API_TOKEN: ${ADMIN_API_TOKEN:-}
-    working_dir: /build
-    command: sh -c "cd apps/dashboard && npm run dev -- --host 0.0.0.0 --port 5173"
+    # The API URL and token are entered in the dashboard's login form and
+    # called from the browser, so no build-time API env is needed.
     ports:
-      - "5173:5173"
+      - "5173:80"
     restart: unless-stopped
     networks:
       - nodal-net

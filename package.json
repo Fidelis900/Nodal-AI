@@ -2,13 +2,26 @@
   "name": "nodal-ai",
   "version": "1.0.0",
   "description": "Modular, secure Stellar Agent Kit with PayFi / x402 support",
-  "private": true,
-  "bin": {
-    "nodal-mcp": "dist/backend/mcp/index.js"
-  },
   "engines": {
     "node": ">=22.0.0"
   },
+  "main": "./dist/cjs/sdk.js",
+  "module": "./dist/esm/sdk.js",
+  "types": "./dist/types/sdk.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/esm/sdk.js",
+      "require": "./dist/cjs/sdk.js",
+      "types": "./dist/types/sdk.d.ts"
+    }
+  },
+  "files": [
+    "dist/cjs",
+    "dist/esm",
+    "dist/types",
+    "README.md",
+    "LICENSE"
+  ],
   "scripts": {
     "mcp": "npx ts-node backend/mcp/index.ts",
     "mcp:start": "node dist/backend/mcp/index.js",
@@ -16,6 +29,9 @@
     "doctor": "npx ts-node scripts/doctor.ts",
     "audit:verify": "npx ts-node scripts/audit_verify.ts",
     "build": "tsc && node -e \"require('fs').cpSync('backend/db/migrations', 'dist/backend/db/migrations', { recursive: true })\"",
+    "build:lib": "tsc --project tsconfig.lib.json",
+    "build:lib:esm": "tsc --project tsconfig.lib.esm.json",
+    "build:pkg": "npm run build:lib && npm run build:lib:esm",
     "pretest": "tsc --noEmit",
     "typecheck": "tsc --noEmit",
     "test:fuzz": "vitest run tests/fuzz/**",
