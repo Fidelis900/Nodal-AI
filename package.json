@@ -24,6 +24,7 @@
   ],
   "scripts": {
     "mcp": "npx ts-node backend/mcp/index.ts",
+    "mcp:start": "node dist/backend/mcp/index.js",
     "setup": "npx ts-node scripts/setup.ts",
     "doctor": "npx ts-node scripts/doctor.ts",
     "audit:verify": "npx ts-node scripts/audit_verify.ts",

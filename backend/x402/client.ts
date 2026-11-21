@@ -55,11 +55,12 @@ import type { ClientStellarSigner, RpcConfig } from '@x402/stellar';
 
 import { config, MAINNET_SPENDING_CAP } from '../config';
 import { createLogger } from '../utils/logger';
+import { fromStroops, toStroops, tryToStroops } from '../utils/amount';
 import { toCaip2 } from '../network';
 import { assetKey, spendingTracker } from '../spending_tracker';
 import { PolicyViolationError } from '../errors';
 import type { Signer } from '../signer';
-import { sorobanServer } from '../rpc_client';
+import { resolveNetworkPassphrase, sorobanServer } from '../rpc_client';
 
 const log = createLogger('x402-client');
 
@@ -135,16 +136,13 @@ function allowedAssetContracts(): Set<string> {
   const contracts = new Set<string>([config.X402_ASSET_CONTRACT]);
 
   if (config.X402_ALLOWED_ASSETS) {
+    const networkPassphrase = resolveNetworkPassphrase(config.STELLAR_NETWORK);
     for (const entry of config.X402_ALLOWED_ASSETS.split(',').map((s) => s.trim())) {
-      if (entry === 'XLM') {
-        // Native XLM is allowed; its SAC is already well-known but we'll
-        // accept it via findDefaultAsset matching in selectRequirements.
-        continue;
-      }
-      // entries are "CODE:ISSUER"; contract address is in config for the
-      // primary asset. For additional assets we just store the entry string
-      // and compare by contract in selectRequirements below.
-      contracts.add(entry); // kept as CODE:ISSUER for now; matched at selection time
+      // PaymentRequirements.asset is a SAC contract id (C…), so convert each
+      // "XLM" / "CODE:ISSUER" entry to its Stellar Asset Contract address.
+      const [code = '', issuer] = entry.split(':');
+      const asset = entry === 'XLM' ? Asset.native() : new Asset(code, issuer);
+      contracts.add(asset.contractId(networkPassphrase));
     }
   }
 
@@ -191,24 +189,23 @@ function assetKeyForRequirement(asset: string): string {
  * Guard the amount from a PaymentRequirements against AGENT_SPENDING_LIMIT and
  * the mainnet hard cap. Throws with a clear message if either is exceeded.
  */
-function assertAmountWithinLimits(amount: string): void {
-  const parsed = parseFloat(amount);
-  if (isNaN(parsed)) throw new Error(`x402 v2: invalid payment amount "${amount}"`);
+function assertAmountWithinLimits(stroops: bigint): void {
+  const amount = fromStroops(stroops);
 
-  const limit = parseFloat(config.AGENT_SPENDING_LIMIT);
-  if (!isNaN(limit) && parsed > limit) {
+  const limit = tryToStroops(config.AGENT_SPENDING_LIMIT);
+  if (limit !== null && stroops > limit) {
     throw new Error(
       `x402 v2: amount ${amount} exceeds AGENT_SPENDING_LIMIT of ${config.AGENT_SPENDING_LIMIT}`
     );
   }
 
-  if (config.STELLAR_NETWORK === 'mainnet' && parsed > MAINNET_SPENDING_CAP) {
+  if (config.STELLAR_NETWORK === 'mainnet' && stroops > toStroops(String(MAINNET_SPENDING_CAP))) {
     throw new Error(
       `x402 v2: amount ${amount} exceeds mainnet spending cap of ${MAINNET_SPENDING_CAP}`
     );
   }
 
-  if (config.X402_MAX_PRICE && parsed > parseFloat(config.X402_MAX_PRICE)) {
+  if (config.X402_MAX_PRICE && stroops > toStroops(config.X402_MAX_PRICE)) {
     throw new Error(`x402 v2: amount ${amount} exceeds X402_MAX_PRICE of ${config.X402_MAX_PRICE}`);
   }
 }
@@ -296,8 +293,8 @@ function selectRequirements(
     if (req.scheme !== 'exact') continue;
     if (req.network !== agentNetwork && req.network !== 'stellar:*') continue;
 
-    // req.asset is a SAC contract address (C…) or a CODE:ISSUER entry for
-    // non-default assets listed in X402_ALLOWED_ASSETS.
+    // req.asset is a SAC contract address (C…); `allowed` holds the SAC ids of
+    // the default asset and every asset listed in X402_ALLOWED_ASSETS.
     if (allowed.has(req.asset) || allowed.has(req.asset.toUpperCase())) return req;
 
     // Fallback: accept the default asset contract on this network.
@@ -421,7 +418,8 @@ export class X402FetchClient {
     }
 
     // ── 4. Pre-payment guards (before reserving or signing) ──────────────────
-    assertAmountWithinLimits(chosen.amount);
+    const amountStroops = atomicAmountToStroops(chosen.amount);
+    assertAmountWithinLimits(amountStroops);
     assertPayToAllowed(chosen.payTo, this.agentAddress);
 
     if (config.ALLOWED_X402_ORIGINS) {

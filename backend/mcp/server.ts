@@ -12,7 +12,9 @@
  *   - Request bodies are limited to MCP_MAX_BODY_BYTES (default 1 MiB).
  */
 
-import { PayFiAgent, VALUE_MOVING_TASK_TYPES } from '../agent';
+import { createHash, timingSafeEqual } from 'crypto';
+import { PayFiAgent } from '../agent';
+import { config } from '../config';
 import { createLogger } from '../utils/logger';
 
 const log = createLogger('mcp');
@@ -59,7 +61,7 @@ function safeEqual(a: string, b: string): boolean {
  * Read-only tools exposed by default; value-moving require MCP_ALLOW_PAYMENTS.
  */
 function getMCPTools(agent: PayFiAgent): MCPTool[] {
-  const allowPayments = process.env.MCP_ALLOW_PAYMENTS === 'true';
+  const allowPayments = config.MCP_ALLOW_PAYMENTS;
 
   return agent
     .getTools()
@@ -124,10 +126,6 @@ async function handleRequest(agent: PayFiAgent, request: MCPRequest): Promise<MC
             id,
             error: { code: -32601, message: `Tool not found: ${toolName}` },
           };
-        }
-
-        if (tool.valueMoving && !VALUE_MOVING_TASK_TYPES.has(toolName as any)) {
-          // Additional check handled by filter
         }
 
         const result = await agent.run({ type: toolName, payload: args });
@@ -201,6 +199,16 @@ export async function startMCPServer(agent: PayFiAgent): Promise<void> {
  *   - Refuses to start when MCP_ALLOW_PAYMENTS=true and no token is set.
  */
 import express from 'express';
+
+/**
+ * Constant-time token comparison; both sides are hashed so the buffers are
+ * always the same length.
+ */
+function tokensMatch(given: string, expected: string): boolean {
+  const a = createHash('sha256').update(given).digest();
+  const b = createHash('sha256').update(expected).digest();
+  return timingSafeEqual(a, b);
+}
 
 export function startMCPHTTPServer(agent: PayFiAgent, port = 3001): void {
   const allowPayments = process.env.MCP_ALLOW_PAYMENTS === 'true';
