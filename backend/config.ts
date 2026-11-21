@@ -189,6 +189,10 @@ export const EnvSchema = z.object({
   // How long a pending approval waits for a decision before it expires.
   APPROVAL_TTL_MS: z.coerce.number().int().min(1_000).default(3_600_000),
 
+  // How often the MPP channel sweeper marks timed-out channels Expired and
+  // releases their spending reservations. Defaults to 60,000 (1 minute).
+  MPP_SESSION_SWEEP_INTERVAL_MS: z.coerce.number().int().min(1_000).default(60_000),
+
   // Counterparty policy for value-moving tasks: `allowlist` permits only the
   // listed destinations, `denylist` blocks them, `open` (default) permits any.
   PAYMENT_DESTINATION_POLICY: z
@@ -545,6 +549,13 @@ export interface AgentConfig {
    * its spending reservation is released. Defaults to 3,600,000 (1 hour).
    */
   readonly APPROVAL_TTL_MS: number;
+
+  /**
+   * MPP channel sweep interval in milliseconds. The sweeper marks channels
+   * past their `timeoutAt` as `Expired` and releases their reservations.
+   * Defaults to 60,000 (1 minute).
+   */
+  readonly MPP_SESSION_SWEEP_INTERVAL_MS: number;
 
   /**
    * Counterparty policy enforced for every value-moving task.

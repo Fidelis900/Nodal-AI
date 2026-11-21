@@ -28,7 +28,7 @@ import type {
 } from '../persistence';
 import type { AgentResult } from '../agent';
 import { migratePostgres } from './migrate';
-import type { Storage } from './storage';
+import type { MppSessionRecord, Storage } from './storage';
 
 /** Advisory-lock key serialising audit-log appends. Arbitrary but fixed. */
 const AUDIT_LOCK_KEY = 7_440_744;
@@ -272,6 +272,18 @@ export class PostgresStorage implements Storage {
       `mpp_session:${channelId}`,
     ]);
     return rows[0]?.value;
+  }
+
+  async listMppSessions(): Promise<MppSessionRecord[]> {
+    const prefix = 'mpp_session:';
+    const { rows } = await this.pool.query(
+      `SELECT key, value FROM agent_state WHERE starts_with(key, $1)`,
+      [prefix]
+    );
+    return rows.map((r: { key: string; value: string }) => ({
+      channelId: r.key.slice(prefix.length),
+      state: r.value,
+    }));
   }
 
   // ─── X402 Rate Limiter ───────────────────────────────────────────────────────
