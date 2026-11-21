@@ -8,6 +8,7 @@
 
 import { describe, it, expect, vi, beforeEach, afterEach, beforeAll, afterAll } from 'vitest';
 import { randomUUID } from 'crypto';
+import { Asset, Networks } from '@stellar/stellar-sdk';
 import type { Keypair } from '@stellar/stellar-sdk';
 import { config, AgentConfig } from '../backend/config';
 import { X402PaymentTool } from '../backend/tools/X402PaymentTool';
@@ -19,6 +20,8 @@ import { _setDb } from '../backend/persistence';
 import { spendingTracker } from '../backend/spending_tracker';
 import { x402RateLimiter } from '../backend/x402_rate_limiter';
 import type { Signer } from '../backend/signer';
+import { RpcUnavailableError } from '../backend/errors';
+import { sorobanServer } from '../backend/rpc_client';
 
 // ─── Mock dependencies ────────────────────────────────────────────────────────
 
@@ -116,6 +119,7 @@ vi.mock('../backend/signer', () => ({
 vi.mock('../backend/rpc_client', async (importOriginal) => ({
   ...(await importOriginal<object>()),
   withRetry: (fn: () => Promise<unknown>) => fn(),
+  sorobanServer: { getLatestLedger: vi.fn() },
   horizonServer: {
     ledgers: vi.fn().mockReturnValue({
       ledger: vi.fn().mockReturnValue({
@@ -146,7 +150,11 @@ vi.mock('../backend/tools/StellarPaymentTool', async (importOriginal) => ({
 
 // The seam X402FetchClient talks through: signing and header encoding belong to
 // the x402 packages, the guards and the spend accounting under test are ours.
-const { httpClient } = vi.hoisted(() => ({
+const { httpClient, stellarSigners } = vi.hoisted(() => ({
+  // Signer adapters handed to ExactStellarScheme, one per X402FetchClient.
+  stellarSigners: [] as Array<{
+    signAuthEntry: (entryXdr: string, opts: { networkPassphrase: string }) => Promise<string>;
+  }>,
   httpClient: {
     getPaymentRequiredResponse: vi.fn(),
     createPaymentPayload: vi.fn(),
@@ -169,7 +177,11 @@ vi.mock('@x402/core/client', () => ({
 }));
 
 vi.mock('@x402/stellar/exact/client', () => ({
-  ExactStellarScheme: class {},
+  ExactStellarScheme: class {
+    constructor(signer: (typeof stellarSigners)[number]) {
+      stellarSigners.push(signer);
+    }
+  },
 }));
 
 // ─── Helper functions ─────────────────────────────────────────────────────────
@@ -223,7 +235,7 @@ function requirement(overrides: Record<string, unknown> = {}): Record<string, un
     scheme: 'exact',
     network: 'stellar:testnet',
     asset: config.X402_ASSET_CONTRACT,
-    amount: '1.5',
+    amount: '15000000', // atomic units: 1.5 USDC at 7 decimals
     payTo: createValidChallenge().payTo,
     ...overrides,
   };
@@ -344,9 +356,9 @@ describe('x402 v2 Interoperability', () => {
     it('chooses the exact-scheme offer on the agent network from accepts', async () => {
       httpClient.getPaymentRequiredResponse.mockReturnValue({
         accepts: [
-          requirement({ network: 'stellar:pubnet', amount: '9' }),
-          requirement({ scheme: 'upto', amount: '8' }),
-          requirement({ amount: '2' }),
+          requirement({ network: 'stellar:pubnet', amount: '90000000' }),
+          requirement({ scheme: 'upto', amount: '80000000' }),
+          requirement({ amount: '20000000' }),
         ],
       });
       stubPaidServer();
@@ -388,6 +400,85 @@ describe('x402 v2 Interoperability', () => {
       await expect(buyer().fetch(PAID_URL)).rejects.toThrow(/own address/);
 
       expect(httpClient.createPaymentPayload).not.toHaveBeenCalled();
+    });
+
+    it('reserves 0.01 USDC for an atomic 100000 requirement under a 1 USDC limit', async () => {
+      const mutable = config as unknown as { AGENT_SPENDING_LIMIT: string };
+      const original = mutable.AGENT_SPENDING_LIMIT;
+      mutable.AGENT_SPENDING_LIMIT = '1';
+      try {
+        // 0.01 USDC at 7 decimals
+        httpClient.getPaymentRequiredResponse.mockReturnValue({
+          accepts: [requirement({ amount: '100000' })],
+        });
+        stubPaidServer();
+
+        const { settlement } = await buyer().fetch(PAID_URL);
+
+        expect(settlement?.success).toBe(true);
+        expect(spendingTracker.total()).toBe(0.01);
+      } finally {
+        mutable.AGENT_SPENDING_LIMIT = original;
+      }
+    });
+
+    it('rejects an atomic amount above AGENT_SPENDING_LIMIT', async () => {
+      httpClient.getPaymentRequiredResponse.mockReturnValue({
+        accepts: [requirement({ amount: '1000000001' })], // 100.0000001 USDC
+      });
+      stubPaidServer();
+
+      await expect(buyer().fetch(PAID_URL)).rejects.toThrow(/exceeds AGENT_SPENDING_LIMIT/);
+
+      expect(httpClient.createPaymentPayload).not.toHaveBeenCalled();
+      expect(spendingTracker.total()).toBe(0);
+    });
+
+    describe('X402_ALLOWED_ASSETS', () => {
+      const ISSUER = 'GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN';
+      const EURC_CONTRACT = new Asset('EURC', ISSUER).contractId(Networks.TESTNET);
+      const XLM_CONTRACT = Asset.native().contractId(Networks.TESTNET);
+      const mutable = config as unknown as { X402_ALLOWED_ASSETS: string | undefined };
+
+      afterEach(() => {
+        mutable.X402_ALLOWED_ASSETS = undefined;
+      });
+
+      it('selects a second allowed CODE:ISSUER asset by its SAC contract id', async () => {
+        mutable.X402_ALLOWED_ASSETS = `EURC:${ISSUER}`;
+        httpClient.getPaymentRequiredResponse.mockReturnValue({
+          accepts: [requirement({ asset: EURC_CONTRACT })],
+        });
+        stubPaidServer();
+
+        const { settlement } = await buyer().fetch(PAID_URL);
+
+        expect(settlement?.success).toBe(true);
+        expect(httpClient.createPaymentPayload).toHaveBeenCalled();
+      });
+
+      it('maps XLM to the native SAC', async () => {
+        mutable.X402_ALLOWED_ASSETS = 'XLM';
+        httpClient.getPaymentRequiredResponse.mockReturnValue({
+          accepts: [requirement({ asset: XLM_CONTRACT })],
+        });
+        stubPaidServer();
+
+        const { settlement } = await buyer().fetch(PAID_URL);
+
+        expect(settlement?.success).toBe(true);
+      });
+
+      it('still refuses an asset that is not on the allowlist', async () => {
+        mutable.X402_ALLOWED_ASSETS = 'XLM';
+        httpClient.getPaymentRequiredResponse.mockReturnValue({
+          accepts: [requirement({ asset: EURC_CONTRACT })],
+        });
+        stubPaidServer();
+
+        await expect(buyer().fetch(PAID_URL)).rejects.toThrow(/no compatible payment option/);
+        expect(httpClient.createPaymentPayload).not.toHaveBeenCalled();
+      });
     });
 
     it('releases the reservation when the paid request does not settle', async () => {

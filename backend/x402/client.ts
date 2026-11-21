@@ -48,6 +48,33 @@
  */
 
 import { Asset, Networks, xdr } from '@stellar/stellar-sdk';
+
+// Shared HTTP fetch helper with configurable timeout.
+export interface HttpFetchOptions {
+  /** Timeout in milliseconds (default from HTTP_TIMEOUT_MS env or 5000). */
+  timeoutMs?: number;
+  /** Additional fetch init options. */
+  init?: RequestInit;
+}
+
+/**
+ * Perform a fetch with an AbortSignal timeout.
+ * All backend outbound HTTP calls should use this instead of raw fetch.
+ */
+export async function httpFetch(url: string, options: HttpFetchOptions = {}): Promise<Response> {
+  const { timeoutMs = Number(process.env.HTTP_TIMEOUT_MS) || 5000, init = {} } = options;
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const response = await fetch(url, { ...init, signal: controller.signal });
+    clearTimeout(timeout);
+    return response;
+  } catch (err) {
+    clearTimeout(timeout);
+    throw err;
+  }
+}
+
 import { x402Client, x402HTTPClient } from '@x402/core/client';
 import type { PaymentRequired, PaymentRequirements, SettleResponse } from '@x402/core/types';
 import { ExactStellarScheme } from '@x402/stellar/exact/client';
@@ -55,11 +82,12 @@ import type { ClientStellarSigner, RpcConfig } from '@x402/stellar';
 
 import { config, MAINNET_SPENDING_CAP } from '../config';
 import { createLogger } from '../utils/logger';
+import { fromStroops, toStroops, tryToStroops } from '../utils/amount';
 import { toCaip2 } from '../network';
 import { assetKey, spendingTracker } from '../spending_tracker';
 import { PolicyViolationError } from '../errors';
 import type { Signer } from '../signer';
-import { sorobanServer } from '../rpc_client';
+import { resolveNetworkPassphrase, sorobanServer } from '../rpc_client';
 
 const log = createLogger('x402-client');
 
@@ -97,20 +125,23 @@ class NodalClientStellarSigner implements ClientStellarSigner {
    * and Nodal's Signer.signAuthEntry (xdr.SorobanAuthorizationEntry in/out).
    */
   async signAuthEntry(entryXdr: string, opts: { networkPassphrase: string }): Promise<string> {
-    // Deserialise the incoming base64 XDR → SorobanAuthorizationEntry
-    const entry = xdr.SorobanAuthorizationEntry.fromXDR(entryXdr, 'base64');
-
     // Derive the ledger expiry: current ledger + buffer
     let validUntilLedgerSeq: number;
     try {
       const latestLedger = await sorobanServer.getLatestLedger();
       validUntilLedgerSeq = latestLedger.sequence + DEFAULT_AUTH_EXPIRY_LEDGERS;
-    } catch {
-      // If we cannot fetch the ledger, use a reasonable absolute value.
-      // ExactStellarScheme will re-simulate and may override this.
-      validUntilLedgerSeq = 0;
-      log.warn('Could not fetch latest ledger for auth entry expiry; using 0');
+    } catch (err) {
+      // Without the current ledger any expiry we pick is wrong (0 is already
+      // expired), so refuse to sign rather than hand out an unusable signature.
+      log.warn('Could not fetch latest ledger for auth entry expiry; not signing');
+      throw new RpcUnavailableError(
+        'x402 v2: Soroban RPC is unavailable; cannot derive the auth entry expiry ledger',
+        err
+      );
     }
+
+    // Deserialise the incoming base64 XDR → SorobanAuthorizationEntry
+    const entry = xdr.SorobanAuthorizationEntry.fromXDR(entryXdr, 'base64');
 
     const signed = await this.signer.signAuthEntry(
       entry,
@@ -135,16 +166,13 @@ function allowedAssetContracts(): Set<string> {
   const contracts = new Set<string>([config.X402_ASSET_CONTRACT]);
 
   if (config.X402_ALLOWED_ASSETS) {
+    const networkPassphrase = resolveNetworkPassphrase(config.STELLAR_NETWORK);
     for (const entry of config.X402_ALLOWED_ASSETS.split(',').map((s) => s.trim())) {
-      if (entry === 'XLM') {
-        // Native XLM is allowed; its SAC is already well-known but we'll
-        // accept it via findDefaultAsset matching in selectRequirements.
-        continue;
-      }
-      // entries are "CODE:ISSUER"; contract address is in config for the
-      // primary asset. For additional assets we just store the entry string
-      // and compare by contract in selectRequirements below.
-      contracts.add(entry); // kept as CODE:ISSUER for now; matched at selection time
+      // PaymentRequirements.asset is a SAC contract id (C…), so convert each
+      // "XLM" / "CODE:ISSUER" entry to its Stellar Asset Contract address.
+      const [code = '', issuer] = entry.split(':');
+      const asset = entry === 'XLM' ? Asset.native() : new Asset(code, issuer);
+      contracts.add(asset.contractId(networkPassphrase));
     }
   }
 
@@ -191,24 +219,23 @@ function assetKeyForRequirement(asset: string): string {
  * Guard the amount from a PaymentRequirements against AGENT_SPENDING_LIMIT and
  * the mainnet hard cap. Throws with a clear message if either is exceeded.
  */
-function assertAmountWithinLimits(amount: string): void {
-  const parsed = parseFloat(amount);
-  if (isNaN(parsed)) throw new Error(`x402 v2: invalid payment amount "${amount}"`);
+function assertAmountWithinLimits(stroops: bigint): void {
+  const amount = fromStroops(stroops);
 
-  const limit = parseFloat(config.AGENT_SPENDING_LIMIT);
-  if (!isNaN(limit) && parsed > limit) {
+  const limit = tryToStroops(config.AGENT_SPENDING_LIMIT);
+  if (limit !== null && stroops > limit) {
     throw new Error(
       `x402 v2: amount ${amount} exceeds AGENT_SPENDING_LIMIT of ${config.AGENT_SPENDING_LIMIT}`
     );
   }
 
-  if (config.STELLAR_NETWORK === 'mainnet' && parsed > MAINNET_SPENDING_CAP) {
+  if (config.STELLAR_NETWORK === 'mainnet' && stroops > toStroops(String(MAINNET_SPENDING_CAP))) {
     throw new Error(
       `x402 v2: amount ${amount} exceeds mainnet spending cap of ${MAINNET_SPENDING_CAP}`
     );
   }
 
-  if (config.X402_MAX_PRICE && parsed > parseFloat(config.X402_MAX_PRICE)) {
+  if (config.X402_MAX_PRICE && stroops > toStroops(config.X402_MAX_PRICE)) {
     throw new Error(`x402 v2: amount ${amount} exceeds X402_MAX_PRICE of ${config.X402_MAX_PRICE}`);
   }
 }
@@ -296,8 +323,8 @@ function selectRequirements(
     if (req.scheme !== 'exact') continue;
     if (req.network !== agentNetwork && req.network !== 'stellar:*') continue;
 
-    // req.asset is a SAC contract address (C…) or a CODE:ISSUER entry for
-    // non-default assets listed in X402_ALLOWED_ASSETS.
+    // req.asset is a SAC contract address (C…); `allowed` holds the SAC ids of
+    // the default asset and every asset listed in X402_ALLOWED_ASSETS.
     if (allowed.has(req.asset) || allowed.has(req.asset.toUpperCase())) return req;
 
     // Fallback: accept the default asset contract on this network.
@@ -384,6 +411,9 @@ export class X402FetchClient {
     const urlStr = url instanceof URL ? url.toString() : url;
     const replayInit = await toReplayableInit(init);
 
+    // ── 0. Origin guard (before any request leaves the agent) ────────────────
+    assertOriginAllowed(new URL(urlStr));
+
     // ── 1. Probe request ─────────────────────────────────────────────────────
     const probeResponse = await globalThis.fetch(urlStr, replayInit);
 
@@ -421,16 +451,9 @@ export class X402FetchClient {
     }
 
     // ── 4. Pre-payment guards (before reserving or signing) ──────────────────
-    assertAmountWithinLimits(chosen.amount);
+    const amountStroops = atomicAmountToStroops(chosen.amount);
+    assertAmountWithinLimits(amountStroops);
     assertPayToAllowed(chosen.payTo, this.agentAddress);
-
-    if (config.ALLOWED_X402_ORIGINS) {
-      const allowedOrigins = new Set(config.ALLOWED_X402_ORIGINS.split(',').map((o) => o.trim()));
-      const hostname = new URL(urlStr).hostname;
-      if (!allowedOrigins.has(hostname)) {
-        throw new Error(`x402 v2: untrusted resource origin: ${hostname}`);
-      }
-    }
 
     // ── 5. Reserve spend ─────────────────────────────────────────────────────
     const reservationId = spendingTracker.reserve(
@@ -444,6 +467,9 @@ export class X402FetchClient {
       paymentPayload = await this.httpClient.createPaymentPayload(paymentRequired);
     } catch (err) {
       spendingTracker.release(reservationId);
+      // Keep the typed error so the caller can tell an RPC outage (retryable)
+      // from other signing failures.
+      if (err instanceof RpcUnavailableError) throw err;
       throw new Error(
         `x402 v2: failed to create payment payload for ${urlStr}: ${err instanceof Error ? err.message : String(err)}`
       );
