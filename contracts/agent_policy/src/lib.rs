@@ -52,6 +52,8 @@ pub enum DataKey {
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PolicyState {
+    // NOTE: This struct is part of the `agent_policy` crate which should be included in the workspace defined at `contracts/Cargo.toml`.
+
     pub owner: Address,
     pub token: Address,
     pub limit: i128,
