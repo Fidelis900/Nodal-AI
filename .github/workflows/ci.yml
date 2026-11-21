@@ -232,6 +232,18 @@ jobs:
       - name: Boot check — better-sqlite3 native binding loads
         run: docker run --rm nodal-ai:smoke node -e "new (require('better-sqlite3'))(':memory:')"
 
+      - name: Build dashboard image
+        run: docker build --target dashboard -t nodal-dashboard:smoke .
+
+      - name: Dashboard serves the production build (#970)
+        run: |
+          docker run -d --name dash -p 8080:80 nodal-dashboard:smoke
+          for i in $(seq 1 10); do curl -fs http://127.0.0.1:8080/ >/dev/null && break; sleep 1; done
+          curl -fs http://127.0.0.1:8080/ | grep -q '<div id="root">'
+          ! curl -fs http://127.0.0.1:8080/ | grep -q '/@vite/client'
+          curl -fs http://127.0.0.1:8080/approvals | grep -q '<div id="root">'
+          docker rm -f dash
+
   secret-scan:
     runs-on: ubuntu-latest
 
