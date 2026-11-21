@@ -8,6 +8,36 @@
 import pino from 'pino';
 
 const isDev = process.env.NODE_ENV !== 'production';
+const isVitest = process.env.VITEST === 'true';
+
+// error (50) and fatal (60) — see https://getpino.io/#/docs/api?id=level-string
+const ERROR_LEVEL_THRESHOLD = 50;
+
+/**
+ * Error/fatal log entries captured during a Vitest run (#1006). Read and
+ * cleared by tests/helpers/expectLoggedError.ts's global afterEach, which
+ * fails a test whose code path logged an error/fatal that the test didn't
+ * explicitly allow via `expectLoggedError()`. Always empty outside Vitest.
+ */
+export const testErrorLogCapture: { level: number; msg: string }[] = [];
+
+/** Pulls a human-readable message out of a pino log call's argument list. */
+function extractLogMessage(args: unknown[]): string {
+  for (const arg of args) {
+    if (typeof arg === 'string') return arg;
+    if (arg instanceof Error) return arg.message;
+    // pino treats a `msg` field on the merging object as the log message
+    // when no separate message argument is given (e.g. log.error({ msg: '...' })).
+    if (
+      arg !== null &&
+      typeof arg === 'object' &&
+      typeof (arg as { msg?: unknown }).msg === 'string'
+    ) {
+      return (arg as { msg: string }).msg;
+    }
+  }
+  return '';
+}
 
 // Transaction memos (e.g. the nonce slices X402PaymentTool writes) can carry
 // caller-supplied, potentially user-identifiable strings, so they're stripped
@@ -59,7 +89,10 @@ export const logger = pino({
     remove: true,
   },
   hooks: {
-    logMethod(args, method) {
+    logMethod(args, method, level) {
+      if (isVitest && level >= ERROR_LEVEL_THRESHOLD) {
+        testErrorLogCapture.push({ level, msg: extractLogMessage(args) });
+      }
       const redacted = args.map(redactSecrets);
       return method.apply(this, redacted as Parameters<typeof method>);
     },
