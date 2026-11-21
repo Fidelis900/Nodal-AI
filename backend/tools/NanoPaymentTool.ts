@@ -15,9 +15,9 @@
 import axios from 'axios';
 import { z } from 'zod';
 import * as crypto from 'crypto';
-import { ValidationError } from '../errors';
+import { ConfigError, ValidationError } from '../errors';
 import { createLogger } from '../utils/logger';
-import { config } from '../config';
+import { config, getNanoSeed } from '../config';
 
 const log = createLogger('nano-payment-tool');
 
@@ -37,8 +37,6 @@ export const NanoPaymentInputSchema = z.object({
     .refine((v) => !/^\d+$/.test(v) || BigInt(v) > 0n, 'amountRaw must be greater than zero'),
   /** Optional sender account (nano_ address) */
   senderAccount: z.string().regex(NANO_ADDRESS_REGEX).optional(),
-  /** Optional externalized seed / private key (hex string) */
-  senderSeed: z.string().optional(),
   /** Optional Nano node RPC URL */
   rpcUrl: z.string().url().optional(),
   /** Optional flag to bypass pre-check gate */
@@ -70,10 +68,11 @@ export interface NanoAccountInfoResponse {
 
 export class NanoPaymentTool {
   private defaultRpcUrl: string;
-  private defaultSeed?: string | undefined;
+  private seed?: string | undefined;
 
-  constructor(defaultSeed?: string, defaultRpcUrl?: string) {
-    this.defaultSeed = defaultSeed;
+  /** The seed comes from NANO_SEED / NANO_SEED_ARN unless injected (tests). */
+  constructor(seed?: string, defaultRpcUrl?: string) {
+    this.seed = seed ?? getNanoSeed();
     this.defaultRpcUrl = defaultRpcUrl || config.NANO_RPC_URL;
   }
 
@@ -128,6 +127,15 @@ export class NanoPaymentTool {
    * Execute a feeless Nano payment.
    */
   async execute(rawInput: unknown): Promise<NanoPaymentResult> {
+    // Secrets must not travel through planners, MCP, webhooks or persistence.
+    if (rawInput && typeof rawInput === 'object' && 'senderSeed' in rawInput) {
+      throw new ValidationError(
+        'senderSeed is not accepted in the task payload; configure NANO_SEED or NANO_SEED_ARN'
+      );
+    }
+    if (!this.seed) {
+      throw new ConfigError('Nano payments require NANO_SEED or NANO_SEED_ARN to be configured');
+    }
     const parsed = NanoPaymentInputSchema.safeParse(rawInput);
     if (!parsed.success) {
       const issue = parsed.error.issues[0];
@@ -153,7 +161,7 @@ export class NanoPaymentTool {
     const blockHash = this.generateBlockHash(
       input.recipient,
       input.amountRaw,
-      input.senderSeed || this.defaultSeed || 'default-seed'
+      this.seed
     );
 
     // Broadcast send block to Nano node RPC if available

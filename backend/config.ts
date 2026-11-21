@@ -266,6 +266,17 @@ export const EnvSchema = z.object({
 
   // Nano node RPC endpoint used by NanoPaymentTool.
   NANO_RPC_URL: z.string().url().default('http://127.0.0.1:7076'),
+  // Nano signing seed (#975). Loaded from env or AWS Secrets Manager, never
+  // from a task payload. Required at startup when NANO_ENABLED=true.
+  NANO_ENABLED: z
+    .enum(['true', 'false'])
+    .default('false')
+    .transform((v) => v === 'true'),
+  NANO_SEED: z
+    .string()
+    .regex(/^[0-9A-Fa-f]{64}$/, 'NANO_SEED must be a 64-character hex seed')
+    .optional(),
+  NANO_SEED_ARN: z.string().optional(),
 
   // MCP server
   MCP_ALLOW_PAYMENTS: z
@@ -701,6 +712,9 @@ export interface AgentConfig {
 
   /** Nano node RPC endpoint used by NanoPaymentTool (default: http://127.0.0.1:7076). */
   readonly NANO_RPC_URL: string;
+  /** Whether the nano_payment task is enabled (requires NANO_SEED or NANO_SEED_ARN). */
+  readonly NANO_ENABLED: boolean;
+  readonly NANO_SEED_ARN?: string | undefined;
   readonly CONTRACT_EVENT_POLL_MS?: number | undefined;
   readonly WEBHOOK_URL?: string | undefined;
   readonly WEBHOOK_SECRET?: string | undefined;
@@ -1001,8 +1015,17 @@ function parseConfigAndDerive(
     WEBHOOK_SECRET,
     DATABASE_URL,
     LLM_API_KEY: _llmApiKey, // Secret - never exposed on config
+    NANO_SEED: nanoSeed, // Secret - exposed only through getNanoSeed()
     ...rest
   } = raw;
+
+  if (raw.NANO_ENABLED && !nanoSeed) {
+    process.stderr.write(
+      '❌ [Config] NANO_ENABLED=true requires NANO_SEED or NANO_SEED_ARN.\n'
+    );
+    process.exit(1);
+  }
+  _nanoSeed = nanoSeed;
 
   const rpcTimeoutMs = raw.RPC_TIMEOUT_MS ?? raw.RETRY_DELAY_MS * raw.MAX_RETRIES * 2;
 
@@ -1072,7 +1095,18 @@ function loadConfigSync(): AgentConfig {
   return parseConfigAndDerive();
 }
 
+let _nanoSeed: string | undefined;
+
+/** The Nano signing seed from NANO_SEED / NANO_SEED_ARN, if configured. */
+export function getNanoSeed(): string | undefined {
+  return _nanoSeed;
+}
+
 function assertSecretConfigCompatibility(): void {
+  if (process.env.NANO_SEED && process.env.NANO_SEED_ARN) {
+    process.stderr.write('❌ [Config] Cannot specify both NANO_SEED and NANO_SEED_ARN.\n');
+    process.exit(1);
+  }
   if (process.env.AGENT_SECRET_KEY && process.env.AGENT_SECRET_KEY_ARN) {
     process.stderr.write(
       '❌ [Config] Cannot specify both AGENT_SECRET_KEY and AGENT_SECRET_KEY_ARN.\n'
@@ -1116,6 +1150,17 @@ export async function loadConfig(): Promise<AgentConfig> {
     }
   }
 
+  if (process.env.NANO_SEED_ARN) {
+    try {
+      process.env.NANO_SEED = (await fetchSecretFromArn(process.env.NANO_SEED_ARN)).trim();
+    } catch (err: any) {
+      process.stderr.write(
+        `❌ [Config] Failed to fetch NANO_SEED_ARN from AWS Secrets Manager: ${err.message}\n`
+      );
+      process.exit(1);
+    }
+  }
+
   return parseConfigAndDerive();
 }
 
@@ -1130,7 +1175,11 @@ if (process.env.AGENT_SECRET_KEY && process.env.AGENT_SECRET_KEY_ARN) {
   process.stderr.write(
     '❌ [Config] Cannot specify both AGENT_SECRET_KEY and AGENT_SECRET_KEY_ARN.\n'
   );
-} else if (process.env.AGENT_SECRET_KEY && !process.env.AGENT_SECRET_KEY_ARN) {
+} else if (
+  process.env.AGENT_SECRET_KEY &&
+  !process.env.AGENT_SECRET_KEY_ARN &&
+  !process.env.NANO_SEED_ARN
+) {
   try {
     _config = loadConfigSync();
   } catch (err: any) {
