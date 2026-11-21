@@ -65,6 +65,8 @@ vi.mock('../backend/config', () => {
     MCP_ALLOW_PAYMENTS: false,
     MCP_TRANSPORT: 'stdio' as const,
     MCP_PORT: 3001,
+    MCP_HOST: '127.0.0.1',
+    MCP_MAX_BODY_BYTES: 1_048_576,
     HEALTH_PORT: 3000,
     WEBHOOK_URL: undefined,
     WEBHOOK_SECRET: undefined,
@@ -83,6 +85,7 @@ vi.mock('../backend/config', () => {
     SPENDING_LIMITS_MAP: new Map<string, string>(),
     SPENDING_LIMITS_ALLOW_UNKNOWN: false,
     NANO_RPC_URL: 'http://127.0.0.1:7076',
+    NANO_ENABLED: false,
   };
 
   return {

@@ -150,6 +150,17 @@ function allowedAssetContracts(): Set<string> {
 }
 
 /**
+ * Convert a PaymentRequirements amount to stroops. In x402 v2 `amount` is in
+ * the token's smallest unit; the payable assets are Stellar Asset Contracts
+ * wrapping classic assets, which always use 7 decimals, so one atomic unit is
+ * exactly one stroop (0.01 USDC is "100000").
+ */
+function atomicAmountToStroops(amount: string): bigint {
+  if (!/^\d+$/.test(amount)) throw new Error(`x402 v2: invalid payment amount "${amount}"`);
+  return BigInt(amount);
+}
+
+/**
  * Map the SAC contract address a requirement pays in (`req.asset`) back to the
  * spending tracker's canonical asset key (`CODE:ISSUER` or `XLM`), so per-asset
  * SPENDING_LIMITS apply to the asset actually paid. The default x402 asset and

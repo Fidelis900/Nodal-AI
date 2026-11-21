@@ -84,7 +84,7 @@ function buildTestApp(opts: {
   if (apiToken) {
     const { timingSafeEqual } = require('crypto') as typeof import('crypto');
 
-    function safeEqual(a: string, b: string): boolean {
+    const safeEqual = (a: string, b: string): boolean => {
       const aBuf = Buffer.from(a, 'utf8');
       const bBuf = Buffer.from(b, 'utf8');
       if (aBuf.length !== bBuf.length) {
@@ -92,7 +92,7 @@ function buildTestApp(opts: {
         return false;
       }
       return timingSafeEqual(aBuf, bBuf);
-    }
+    };
 
     app.use((req, res, next) => {
       const authHeader = req.headers['authorization'] ?? '';
@@ -163,9 +163,9 @@ describe('MCP HTTP authentication — issue #911', () => {
 
   describe('payments + no token → startup error', () => {
     it('throws synchronously when MCP_ALLOW_PAYMENTS=true and no token is set', () => {
-      expect(() =>
-        buildTestApp({ allowPayments: true, apiToken: undefined })
-      ).toThrow('MCP_API_TOKEN must be set when MCP_ALLOW_PAYMENTS=true');
+      expect(() => buildTestApp({ allowPayments: true })).toThrow(
+        'MCP_API_TOKEN must be set when MCP_ALLOW_PAYMENTS=true'
+      );
     });
 
     it('does NOT throw when MCP_ALLOW_PAYMENTS=true AND a token is provided', () => {
