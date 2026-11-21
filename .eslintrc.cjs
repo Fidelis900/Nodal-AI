@@ -51,10 +51,8 @@ module.exports = {
       },
     },
     {
-      files: [
-        "backend/agent.ts",
-        "backend/tools/**/*.ts",
-      ],
+      files: ["backend/**/*.ts"],
+      excludedFiles: ["backend/config.ts"],
 
       // Environment variables must be accessed through backend/config.ts
       // so they pass Zod validation and secret-redaction logic.

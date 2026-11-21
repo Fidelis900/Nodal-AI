@@ -17,7 +17,9 @@ import { startMCPServer, startMCPHTTPServer } from './server';
 
 if (require.main === module) {
   const agent = new PayFiAgent();
-  if (config.MCP_TRANSPORT === 'http') {
+  const transport = config.MCP_TRANSPORT;
+
+  if (transport === 'http') {
     startMCPHTTPServer(agent, config.MCP_PORT);
   } else {
     startMCPServer(agent);

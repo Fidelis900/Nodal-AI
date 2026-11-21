@@ -10,8 +10,9 @@
  */
 
 import pino from 'pino';
+import { config } from '../config';
 
-const isDev = process.env.NODE_ENV !== 'production';
+const isDev = config.NODE_ENV !== 'production';
 
 /** True when the process is acting as an MCP stdio server. */
 const isMCPStdio = process.env.MCP_TRANSPORT === 'stdio' || process.env.MCP_TRANSPORT === undefined;
@@ -59,11 +60,8 @@ export function redactSecrets(value: unknown): unknown {
   return value;
 }
 
-// In stdio MCP mode stdout is the JSON-RPC channel, so all log output must go
-// to stderr.  pino-pretty's transport worker also needs `destination: 2` so it
-// does not open its own stdout handle.
-const pinoOptions: pino.LoggerOptions = {
-  level: process.env.LOG_LEVEL ?? 'info',
+export const logger = pino({
+  level: config.LOG_LEVEL ?? 'info',
   redact: {
     paths: REDACT_PATHS,
     remove: true,

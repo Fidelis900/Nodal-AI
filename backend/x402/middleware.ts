@@ -66,7 +66,7 @@ const log = createLogger('x402-middleware');
  *   price: '0.01',
  *   payTo: 'G...',
  *   facilitatorUrl: 'https://facilitator.openzeppelin.com',
- *   facilitatorApiKey: process.env.OZ_API_KEY,
+ *   facilitatorApiKey: getOZApiKey(),
  * })
  * ```
  */

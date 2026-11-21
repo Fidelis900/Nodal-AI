@@ -67,7 +67,23 @@ vi.mock('../backend/config', () => {
     MCP_ALLOW_PAYMENTS: false,
     MCP_TRANSPORT: 'stdio' as const,
     MCP_PORT: 3001,
+    MCP_HOST: '127.0.0.1',
+    MCP_MAX_BODY_BYTES: 1_048_576,
     HEALTH_PORT: 3000,
+    NANO_ENABLED: false,
+    OTEL_REDACT_TX_HASH: false,
+    NODE_ENV: 'test',
+    LOG_LEVEL: 'info',
+    ALERT_SPENDING_THRESHOLDS: [0.8, 1],
+    ALERT_FAILURE_THRESHOLD: 5,
+    ALERT_FAILURE_WINDOW_MS: 300_000,
+    LLM_MAX_TOKENS_PER_REQUEST: 8_000,
+    LLM_MAX_TOKENS_PER_STEP: 16_000,
+    LLM_MAX_TOOL_CALL_ITERATIONS: 25,
+    LLM_MAX_TOKENS_PER_DAY: 1_000_000,
+    SESSION_TTL_MS: 1_800_000,
+    SESSION_MAX_MESSAGES: 50,
+    SESSION_MAX_SESSIONS: 500,
     WEBHOOK_URL: undefined,
     WEBHOOK_SECRET: undefined,
     ADMIN_API_TOKEN: undefined,
@@ -89,6 +105,7 @@ vi.mock('../backend/config', () => {
 
   return {
     config: mockConfig,
+    getNanoSeed: () => undefined,
   };
 });
 
