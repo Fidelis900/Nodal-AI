@@ -3,15 +3,15 @@
  */
 
 import { PayFiAgent } from '../agent';
+import { config } from '../config';
 import { startMCPServer, startMCPHTTPServer } from './server';
 
 if (require.main === module) {
   const agent = new PayFiAgent();
-  const transport = process.env.MCP_TRANSPORT || 'stdio';
+  const transport = config.MCP_TRANSPORT;
 
   if (transport === 'http') {
-    const port = parseInt(process.env.MCP_PORT || '3001', 10);
-    startMCPHTTPServer(agent, port);
+    startMCPHTTPServer(agent, config.MCP_PORT);
   } else {
     startMCPServer(agent);
   }

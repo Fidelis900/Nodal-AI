@@ -106,8 +106,8 @@ export const EnvSchema = z.object({
   AGENT_SECRET_KEY_ARN: z.string().optional(),
 
   // Signing backend — `local` signs with the in-memory agent keypair, `vault`
-  // delegates to a HashiCorp Vault transit ed25519 key (VAULT_TOKEN is read
-  // from the environment by backend/signers, never stored on config).
+  // delegates to a HashiCorp Vault transit ed25519 key (VAULT_TOKEN is
+  // validated here and exposed only through getVaultToken()).
   SIGNER_BACKEND: z
     .enum(['local', 'vault'], {
       error: () => 'SIGNER_BACKEND must be one of: local | vault',
@@ -116,6 +116,8 @@ export const EnvSchema = z.object({
   VAULT_ADDR: z.string().url('VAULT_ADDR must be a valid URL').optional(),
   VAULT_TRANSIT_MOUNT: z.string().min(1).default('transit'),
   VAULT_TRANSIT_KEY: z.string().min(1).optional(),
+  // Secret used to authenticate to Vault; captured privately and never exposed on AgentConfig.
+  VAULT_TOKEN: z.string().min(1).optional(),
 
   // x402 / PayFi asset
   X402_ASSET_CODE: z.string().min(1).max(12).default('USDC'),
@@ -206,10 +208,15 @@ export const EnvSchema = z.object({
   DATABASE_URL: z.string().min(1).optional(),
 
   // Logging
+  NODE_ENV: z.string().min(1).default('development'),
   LOG_LEVEL: z.enum(['debug', 'info', 'warn', 'error']).default('info'),
 
   // OpenTelemetry
   OTLP_ENDPOINT: z.string().url().optional(),
+  OTEL_REDACT_TX_HASH: z
+    .enum(['true', 'false'])
+    .default('false')
+    .transform((value) => value === 'true'),
 
   // Spending window for rate/cap computation
   SPENDING_WINDOW_MS: z.coerce.number().int().min(100).default(86_400_000),
@@ -303,6 +310,30 @@ export const EnvSchema = z.object({
   WEBHOOK_URL: z.string().url().optional(),
   WEBHOOK_SECRET: z.string().min(1).optional(),
 
+  // Alert delivery endpoints and threshold controls.
+  ALERT_WEBHOOK_URL: z.string().url().optional(),
+  ALERT_SLACK_WEBHOOK_URL: z.string().url().optional(),
+  ALERT_DISCORD_WEBHOOK_URL: z.string().url().optional(),
+  ALERT_SPENDING_THRESHOLDS: z
+    .string()
+    .default('0.8,1')
+    .refine(
+      (value) =>
+        value.split(',').every((entry) => {
+          const threshold = Number(entry.trim());
+          return Number.isFinite(threshold) && threshold > 0;
+        }),
+      'ALERT_SPENDING_THRESHOLDS must be comma-separated positive numbers'
+    )
+    .transform((value) =>
+      [...new Set(value.split(',').map((entry) => Number(entry.trim())))].sort((a, b) => a - b)
+    ),
+  ALERT_FAILURE_THRESHOLD: z.coerce.number().int().min(1).default(5),
+  ALERT_FAILURE_WINDOW_MS: z.coerce.number().int().min(1).default(300_000),
+
+  // Optional fallback API key for OpenZeppelin facilitator integrations.
+  OZ_API_KEY: z.string().min(1).optional(),
+
   /**
    * Per-asset spending limits encoded as a comma-separated string.
    * Format: "ASSET_CODE:LIMIT[,ASSET_CODE:ISSUER:LIMIT,...]"
@@ -390,6 +421,9 @@ export const EnvSchema = z.object({
   // LLM provider: openai, anthropic, or mock (for testing)
   LLM_PROVIDER: z.enum(['openai', 'anthropic', 'mock']).default('mock').optional(),
 
+  // OpenAI-compatible planner endpoint.
+  LLM_ENDPOINT: z.string().url().optional(),
+
   // Model identifier (e.g., gpt-4o, claude-3-sonnet-20240229)
   LLM_MODEL: z.string().min(1).optional(),
 
@@ -407,9 +441,25 @@ export const EnvSchema = z.object({
 
   // Temperature for LLM sampling (0-2)
   LLM_TEMPERATURE: z.coerce.number().min(0).max(2).default(0.7),
+
+  // AI budget limits.
+  LLM_MAX_TOKENS_PER_REQUEST: z.coerce.number().int().min(1).default(8_000),
+  LLM_MAX_TOKENS_PER_STEP: z.coerce.number().int().min(1).default(16_000),
+  LLM_MAX_TOOL_CALL_ITERATIONS: z.coerce.number().int().min(1).default(25),
+  LLM_MAX_TOKENS_PER_DAY: z.coerce.number().int().min(1).default(1_000_000),
+
+  // Bounded in-memory AI conversation store.
+  SESSION_TTL_MS: z.coerce
+    .number()
+    .int()
+    .min(1)
+    .default(30 * 60 * 1_000),
+  SESSION_MAX_MESSAGES: z.coerce.number().int().min(1).default(50),
+  SESSION_MAX_SESSIONS: z.coerce.number().int().min(1).default(500),
 });
 
 type RawEnv = z.infer<typeof EnvSchema>;
+const ApiTokenSchema = EnvSchema.pick({ ADMIN_API_TOKEN: true, WEBHOOK_SECRET: true });
 
 // ─── Derived / enriched config type ──────────────────────────────────────────
 
@@ -600,6 +650,23 @@ export interface AgentConfig {
    * Validated by EnvSchema to be a valid URL string.
    */
   readonly OTLP_ENDPOINT?: string | undefined;
+  /** Whether transaction hashes are omitted from exported traces. Defaults to false. */
+  readonly OTEL_REDACT_TX_HASH: boolean;
+
+  /** Runtime environment name used to select logger output. Defaults to development. */
+  readonly NODE_ENV: string;
+  /** Pino verbosity. Defaults to info. */
+  readonly LOG_LEVEL: 'debug' | 'info' | 'warn' | 'error';
+  /** Alert webhook destinations; each is optional and URL-validated. */
+  readonly ALERT_WEBHOOK_URL?: string | undefined;
+  readonly ALERT_SLACK_WEBHOOK_URL?: string | undefined;
+  readonly ALERT_DISCORD_WEBHOOK_URL?: string | undefined;
+  /** Spending-limit fractions that trigger alerts. Defaults to [0.8, 1]. */
+  readonly ALERT_SPENDING_THRESHOLDS: readonly number[];
+  /** Consecutive task failures before an alert is raised. Defaults to 5. */
+  readonly ALERT_FAILURE_THRESHOLD: number;
+  /** Failure alert rolling window in milliseconds. Defaults to 300,000. */
+  readonly ALERT_FAILURE_WINDOW_MS: number;
 
   /**
    * Spending window in milliseconds for rate/cap computation.
@@ -710,6 +777,21 @@ export interface AgentConfig {
    */
   readonly HEALTH_PORT: number;
 
+  /** LLM request budget in tokens. Defaults to 8,000. */
+  readonly LLM_MAX_TOKENS_PER_REQUEST: number;
+  /** Per-step LLM token budget. Defaults to 16,000. */
+  readonly LLM_MAX_TOKENS_PER_STEP: number;
+  /** Maximum planner tool-call iterations. Defaults to 25. */
+  readonly LLM_MAX_TOOL_CALL_ITERATIONS: number;
+  /** Rolling daily LLM token budget. Defaults to 1,000,000. */
+  readonly LLM_MAX_TOKENS_PER_DAY: number;
+  /** In-memory session idle TTL in milliseconds. Defaults to 30 minutes. */
+  readonly SESSION_TTL_MS: number;
+  /** Maximum conversation messages retained per session. Defaults to 50. */
+  readonly SESSION_MAX_MESSAGES: number;
+  /** Maximum concurrent in-memory sessions. Defaults to 500. */
+  readonly SESSION_MAX_SESSIONS: number;
+
   /** Nano node RPC endpoint used by NanoPaymentTool (default: http://127.0.0.1:7076). */
   readonly NANO_RPC_URL: string;
   /** Whether the nano_payment task is enabled (requires NANO_SEED or NANO_SEED_ARN). */
@@ -750,6 +832,9 @@ export interface AgentConfig {
    * Optional - each provider has its own default if not specified.
    */
   readonly LLM_MODEL?: string | undefined;
+
+  /** OpenAI-compatible planner endpoint. */
+  readonly LLM_ENDPOINT?: string | undefined;
 
   /**
    * Base URL for OpenAI-compatible APIs.
@@ -1014,18 +1099,21 @@ function parseConfigAndDerive(
     WEBHOOK_URL,
     WEBHOOK_SECRET,
     DATABASE_URL,
-    LLM_API_KEY: _llmApiKey, // Secret - never exposed on config
+    LLM_API_KEY: llmApiKey,
+    VAULT_TOKEN: vaultToken,
+    OZ_API_KEY: ozApiKey,
     NANO_SEED: nanoSeed, // Secret - exposed only through getNanoSeed()
     ...rest
   } = raw;
 
   if (raw.NANO_ENABLED && !nanoSeed) {
-    process.stderr.write(
-      '❌ [Config] NANO_ENABLED=true requires NANO_SEED or NANO_SEED_ARN.\n'
-    );
+    process.stderr.write('❌ [Config] NANO_ENABLED=true requires NANO_SEED or NANO_SEED_ARN.\n');
     process.exit(1);
   }
   _nanoSeed = nanoSeed;
+  _llmApiKey = llmApiKey;
+  _vaultToken = vaultToken;
+  _ozApiKey = ozApiKey;
 
   const rpcTimeoutMs = raw.RPC_TIMEOUT_MS ?? raw.RETRY_DELAY_MS * raw.MAX_RETRIES * 2;
 
@@ -1096,10 +1184,34 @@ function loadConfigSync(): AgentConfig {
 }
 
 let _nanoSeed: string | undefined;
+let _llmApiKey: string | undefined;
+let _vaultToken: string | undefined;
+let _ozApiKey: string | undefined;
 
 /** The Nano signing seed from NANO_SEED / NANO_SEED_ARN, if configured. */
 export function getNanoSeed(): string | undefined {
   return _nanoSeed;
+}
+
+/** Returns the Vault token without exposing it on the public config object. */
+export function getVaultToken(): string | undefined {
+  return _vaultToken;
+}
+
+/** Returns the OpenZeppelin API key without exposing it on the public config object. */
+export function getOZApiKey(): string | undefined {
+  return _ozApiKey;
+}
+
+/** Read the HTTP API token per request while validating any runtime rotation. */
+export function getAdminApiToken(): string | undefined {
+  const result = ApiTokenSchema.safeParse(process.env);
+  if (!result.success) {
+    throw new Error(
+      `Invalid HTTP API token configuration:\n${formatValidationErrors(result.error)}`
+    );
+  }
+  return result.data.ADMIN_API_TOKEN || result.data.WEBHOOK_SECRET || undefined;
 }
 
 function assertSecretConfigCompatibility(): void {
@@ -1220,12 +1332,12 @@ export const configPromise = {
 // ─── LLM Provider Helper ───────────────────────────────────────────────────
 
 /**
- * Gets the LLM API key from the environment.
+ * Gets the validated LLM API key from private config state.
  * The key is NEVER exposed on the config object - call this function directly.
  * @returns The LLM API key or undefined if not configured
  */
 export function getLLMApiKey(): string | undefined {
-  return process.env.LLM_API_KEY;
+  return _llmApiKey;
 }
 
 /**
@@ -1240,8 +1352,8 @@ export function getLLMApiKey(): string | undefined {
  */
 export function createLLMProvider():
   ReturnType<typeof import('./ai/providers').createLLMProvider> | undefined {
-  const providerType = process.env.LLM_PROVIDER as 'openai' | 'anthropic' | 'mock' | undefined;
-  const apiKey = process.env.LLM_API_KEY;
+  const providerType = config.LLM_PROVIDER;
+  const apiKey = getLLMApiKey();
 
   if (!providerType) {
     return undefined;
@@ -1255,10 +1367,10 @@ export function createLLMProvider():
   return createProvider({
     provider: providerType,
     // Empty selects each provider's own default model (`config.model || defaultModel`).
-    model: process.env.LLM_MODEL ?? '',
+    model: config.LLM_MODEL ?? '',
     apiKey: apiKey || '',
-    ...(process.env.LLM_BASE_URL ? { baseUrl: process.env.LLM_BASE_URL } : {}),
-    timeoutMs: parseInt(process.env.LLM_TIMEOUT_MS || '60000', 10),
+    ...(config.LLM_BASE_URL ? { baseUrl: config.LLM_BASE_URL } : {}),
+    timeoutMs: config.LLM_TIMEOUT_MS,
     maxRetries: 3,
   });
 }
@@ -1274,6 +1386,7 @@ const FALLBACK_CONFIG: AgentConfig = new Proxy({} as AgentConfig, {
   get(_target, prop, receiver) {
     _fallbackConfig ??= parseConfigAndDerive(
       {
+        ...process.env,
         STELLAR_NETWORK: 'testnet',
         HORIZON_URL: 'https://horizon-testnet.stellar.org',
         SOROBAN_RPC_URL: 'https://soroban-testnet.stellar.org',
@@ -1281,7 +1394,13 @@ const FALLBACK_CONFIG: AgentConfig = new Proxy({} as AgentConfig, {
         X402_ASSET_ISSUER: 'GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN',
         AGENT_SECRET_KEY: Keypair.random().secret(),
         AGENT_SPENDING_LIMIT: '100',
-        ...(process.env.DB_PATH ? { DB_PATH: process.env.DB_PATH } : {}),
+        AGENT_SECRET_KEY_ARN: undefined,
+        SIGNER_BACKEND: 'local',
+        VAULT_TOKEN: undefined,
+        OZ_API_KEY: undefined,
+        NANO_ENABLED: 'false',
+        NANO_SEED: undefined,
+        NANO_SEED_ARN: undefined,
       },
       { announce: false }
     );

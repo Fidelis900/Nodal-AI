@@ -13,7 +13,9 @@
  */
 
 import { PayFiAgent, VALUE_MOVING_TASK_TYPES } from '../agent';
+import { config } from '../config';
 import { createLogger } from '../utils/logger';
+import { timingSafeEqual } from 'crypto';
 
 const log = createLogger('mcp');
 
@@ -42,8 +44,6 @@ export interface MCPResponse {
  * Constant-time string comparison to prevent timing-based token oracle attacks.
  */
 function safeEqual(a: string, b: string): boolean {
-  // Use Node's built-in timingSafeEqual for byte-level protection.
-  const { timingSafeEqual } = require('crypto') as typeof import('crypto');
   const aBuf = Buffer.from(a, 'utf8');
   const bBuf = Buffer.from(b, 'utf8');
   if (aBuf.length !== bBuf.length) {
@@ -59,7 +59,7 @@ function safeEqual(a: string, b: string): boolean {
  * Read-only tools exposed by default; value-moving require MCP_ALLOW_PAYMENTS.
  */
 function getMCPTools(agent: PayFiAgent): MCPTool[] {
-  const allowPayments = process.env.MCP_ALLOW_PAYMENTS === 'true';
+  const allowPayments = config.MCP_ALLOW_PAYMENTS;
 
   return agent
     .getTools()
@@ -203,11 +203,10 @@ export async function startMCPServer(agent: PayFiAgent): Promise<void> {
 import express from 'express';
 
 export function startMCPHTTPServer(agent: PayFiAgent, port = 3001): void {
-  const allowPayments = process.env.MCP_ALLOW_PAYMENTS === 'true';
-  const apiToken = process.env.MCP_API_TOKEN;
-  const host = process.env.MCP_HOST ?? '127.0.0.1';
-  // 1 MiB default; env var allows operator override within reason.
-  const maxBodyBytes = parseInt(process.env.MCP_MAX_BODY_BYTES ?? '1048576', 10);
+  const allowPayments = config.MCP_ALLOW_PAYMENTS;
+  const apiToken = config.MCP_API_TOKEN;
+  const host = config.MCP_HOST;
+  const maxBodyBytes = config.MCP_MAX_BODY_BYTES;
 
   // Hard safety check: payments enabled without a token is not allowed.
   if (allowPayments && !apiToken) {
@@ -233,9 +232,7 @@ export function startMCPHTTPServer(agent: PayFiAgent, port = 3001): void {
   if (apiToken) {
     app.use((req, res, next) => {
       const authHeader = req.headers['authorization'] ?? '';
-      const supplied = authHeader.startsWith('Bearer ')
-        ? authHeader.slice('Bearer '.length)
-        : '';
+      const supplied = authHeader.startsWith('Bearer ') ? authHeader.slice('Bearer '.length) : '';
 
       if (!safeEqual(supplied, apiToken)) {
         res.status(401).json({ error: 'Unauthorized' });

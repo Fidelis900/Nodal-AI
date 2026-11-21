@@ -33,6 +33,9 @@ concurrency:
   group: e2e-${{ github.ref }}
   cancel-in-progress: true
 
+permissions:
+  contents: read
+
 jobs:
   e2e:
     name: e2e (stellar/quickstart)
@@ -53,14 +56,14 @@ jobs:
       X402_ASSET_ISSUER: unused-by-e2e
 
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       # Pull/boot quickstart first: it is the slowest step, so it warms up
       # while the WASM and node_modules are prepared below.
       - name: Start stellar/quickstart (test-only profile)
         run: docker compose --profile test-only up -d stellar-quickstart
 
-      - uses: actions/setup-node@v7
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
           node-version-file: .nvmrc
           cache: npm
@@ -73,7 +76,7 @@ jobs:
         run: rustup target add wasm32-unknown-unknown
 
       - name: Cache cargo
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: |
             ~/.cargo/registry

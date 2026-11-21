@@ -6,8 +6,9 @@
  */
 
 import pino from 'pino';
+import { config } from '../config';
 
-const isDev = process.env.NODE_ENV !== 'production';
+const isDev = config.NODE_ENV !== 'production';
 
 // Transaction memos (e.g. the nonce slices X402PaymentTool writes) can carry
 // caller-supplied, potentially user-identifiable strings, so they're stripped
@@ -53,7 +54,7 @@ export function redactSecrets(value: unknown): unknown {
 }
 
 export const logger = pino({
-  level: process.env.LOG_LEVEL ?? 'info',
+  level: config.LOG_LEVEL ?? 'info',
   redact: {
     paths: REDACT_PATHS,
     remove: true,
