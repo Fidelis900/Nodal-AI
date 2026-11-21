@@ -77,6 +77,17 @@ function getMCPTools(agent: PayFiAgent): MCPTool[] {
     });
 }
 
+/**
+ * How value-moving tool calls are handled (#917):
+ *   approve (default) — create a pending approval; a human approves it via
+ *                       the dashboard / POST /approvals/:id before anything moves.
+ *   direct            — execute immediately. Refused on mainnet unless
+ *                       MCP_FORCE_DIRECT_PAYMENTS=true.
+ */
+function getPaymentMode(): 'approve' | 'direct' {
+  return process.env.MCP_PAYMENT_MODE === 'direct' ? 'direct' : 'approve';
+}
+
 function toolToMCPSchema(tool: MCPTool): object {
   return {
     name: tool.name,
@@ -88,7 +99,10 @@ function toolToMCPSchema(tool: MCPTool): object {
 /**
  * Handle MCP request and return response.
  */
-async function handleRequest(agent: PayFiAgent, request: MCPRequest): Promise<MCPResponse> {
+export async function handleRequest(
+  agent: PayFiAgent,
+  request: MCPRequest
+): Promise<MCPResponse> {
   const { id } = request;
 
   try {
@@ -201,6 +215,7 @@ export async function startMCPServer(agent: PayFiAgent): Promise<void> {
  *   - Refuses to start when MCP_ALLOW_PAYMENTS=true and no token is set.
  */
 import express from 'express';
+import type { Server } from 'http';
 
 /**
  * Constant-time token comparison; both sides are hashed so the buffers are

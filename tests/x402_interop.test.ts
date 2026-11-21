@@ -20,6 +20,8 @@ import { _setDb } from '../backend/persistence';
 import { spendingTracker } from '../backend/spending_tracker';
 import { x402RateLimiter } from '../backend/x402_rate_limiter';
 import type { Signer } from '../backend/signer';
+import { RpcUnavailableError } from '../backend/errors';
+import { sorobanServer } from '../backend/rpc_client';
 
 // ─── Mock dependencies ────────────────────────────────────────────────────────
 
@@ -100,6 +102,7 @@ vi.mock('../backend/signer', () => ({
 vi.mock('../backend/rpc_client', async (importOriginal) => ({
   ...(await importOriginal<object>()),
   withRetry: (fn: () => Promise<unknown>) => fn(),
+  sorobanServer: { getLatestLedger: vi.fn() },
   horizonServer: {
     ledgers: vi.fn().mockReturnValue({
       ledger: vi.fn().mockReturnValue({
@@ -130,7 +133,11 @@ vi.mock('../backend/tools/StellarPaymentTool', async (importOriginal) => ({
 
 // The seam X402FetchClient talks through: signing and header encoding belong to
 // the x402 packages, the guards and the spend accounting under test are ours.
-const { httpClient } = vi.hoisted(() => ({
+const { httpClient, stellarSigners } = vi.hoisted(() => ({
+  // Signer adapters handed to ExactStellarScheme, one per X402FetchClient.
+  stellarSigners: [] as Array<{
+    signAuthEntry: (entryXdr: string, opts: { networkPassphrase: string }) => Promise<string>;
+  }>,
   httpClient: {
     getPaymentRequiredResponse: vi.fn(),
     createPaymentPayload: vi.fn(),
@@ -153,7 +160,11 @@ vi.mock('@x402/core/client', () => ({
 }));
 
 vi.mock('@x402/stellar/exact/client', () => ({
-  ExactStellarScheme: class {},
+  ExactStellarScheme: class {
+    constructor(signer: (typeof stellarSigners)[number]) {
+      stellarSigners.push(signer);
+    }
+  },
 }));
 
 // ─── Helper functions ─────────────────────────────────────────────────────────
