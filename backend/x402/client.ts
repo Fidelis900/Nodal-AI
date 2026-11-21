@@ -14,7 +14,8 @@
  *   6. Guard the amount against AGENT_SPENDING_LIMIT.
  *   7. Reserve the spend, sign the SAC auth entry, encode the PAYMENT header.
  *   8. Retry the request with the payment header.
- *   9. On confirmed settlement (200 + PAYMENT-RESPONSE) → commit the spend.
+ *   9. On confirmed settlement (successful PAYMENT-RESPONSE or a settlement tx
+ *      hash, whatever the HTTP status) → commit the spend.
  *   10. On any failure → release the reservation.
  *
  * ## Design decisions
@@ -46,7 +47,7 @@
  * filtered out before the selector runs.
  */
 
-import { xdr } from '@stellar/stellar-sdk';
+import { Asset, Networks, xdr } from '@stellar/stellar-sdk';
 import { x402Client, x402HTTPClient } from '@x402/core/client';
 import type { PaymentRequired, PaymentRequirements, SettleResponse } from '@x402/core/types';
 import { ExactStellarScheme } from '@x402/stellar/exact/client';
@@ -54,11 +55,12 @@ import type { ClientStellarSigner, RpcConfig } from '@x402/stellar';
 
 import { config, MAINNET_SPENDING_CAP } from '../config';
 import { createLogger } from '../utils/logger';
+import { fromStroops, toStroops, tryToStroops } from '../utils/amount';
 import { toCaip2 } from '../network';
-import { spendingTracker } from '../spending_tracker';
-import { PolicyViolationError, RpcUnavailableError } from '../errors';
+import { assetKey, spendingTracker } from '../spending_tracker';
+import { PolicyViolationError } from '../errors';
 import type { Signer } from '../signer';
-import { sorobanServer } from '../rpc_client';
+import { resolveNetworkPassphrase, sorobanServer } from '../rpc_client';
 
 const log = createLogger('x402-client');
 
@@ -66,6 +68,9 @@ const log = createLogger('x402-client');
 
 /** How many ledgers ahead the auth entry is valid (≈ 50 × 5 s = 250 s). */
 const DEFAULT_AUTH_EXPIRY_LEDGERS = 50;
+
+/** Largest stream request body buffered so it can be replayed on the paid retry. */
+const MAX_BUFFERED_BODY_BYTES = 1024 * 1024;
 
 // ─── Signer adapter ───────────────────────────────────────────────────────────
 
@@ -134,16 +139,13 @@ function allowedAssetContracts(): Set<string> {
   const contracts = new Set<string>([config.X402_ASSET_CONTRACT]);
 
   if (config.X402_ALLOWED_ASSETS) {
+    const networkPassphrase = resolveNetworkPassphrase(config.STELLAR_NETWORK);
     for (const entry of config.X402_ALLOWED_ASSETS.split(',').map((s) => s.trim())) {
-      if (entry === 'XLM') {
-        // Native XLM is allowed; its SAC is already well-known but we'll
-        // accept it via findDefaultAsset matching in selectRequirements.
-        continue;
-      }
-      // entries are "CODE:ISSUER"; contract address is in config for the
-      // primary asset. For additional assets we just store the entry string
-      // and compare by contract in selectRequirements below.
-      contracts.add(entry); // kept as CODE:ISSUER for now; matched at selection time
+      // PaymentRequirements.asset is a SAC contract id (C…), so convert each
+      // "XLM" / "CODE:ISSUER" entry to its Stellar Asset Contract address.
+      const [code = '', issuer] = entry.split(':');
+      const asset = entry === 'XLM' ? Asset.native() : new Asset(code, issuer);
+      contracts.add(asset.contractId(networkPassphrase));
     }
   }
 
@@ -151,27 +153,62 @@ function allowedAssetContracts(): Set<string> {
 }
 
 /**
+ * Map the SAC contract address a requirement pays in (`req.asset`) back to the
+ * spending tracker's canonical asset key (`CODE:ISSUER` or `XLM`), so per-asset
+ * SPENDING_LIMITS apply to the asset actually paid. The default x402 asset and
+ * every `X402_ALLOWED_ASSETS` entry are recognised; anything else is keyed by
+ * the contract address itself, which SPENDING_LIMITS_ALLOW_UNKNOWN then governs.
+ */
+function assetKeyForRequirement(asset: string): string {
+  if (asset === config.X402_ASSET_CONTRACT) {
+    return assetKey(config.X402_ASSET_CODE, config.X402_ASSET_ISSUER);
+  }
+  if (asset.toUpperCase() === 'XLM') return 'XLM';
+  if (asset.includes(':')) {
+    const [code, issuer] = asset.split(':');
+    return assetKey(code!, issuer);
+  }
+
+  const networkPassphrase = {
+    testnet: Networks.TESTNET,
+    mainnet: Networks.PUBLIC,
+    futurenet: Networks.FUTURENET,
+  }[config.STELLAR_NETWORK];
+
+  if (config.X402_ALLOWED_ASSETS) {
+    for (const entry of config.X402_ALLOWED_ASSETS.split(',').map((s) => s.trim())) {
+      const [code, issuer] = entry.split(':');
+      const sac = entry === 'XLM' ? Asset.native() : new Asset(code!, issuer);
+      if (sac.contractId(networkPassphrase) === asset) {
+        return entry === 'XLM' ? 'XLM' : assetKey(code!, issuer);
+      }
+    }
+  }
+
+  return asset;
+}
+
+/**
  * Guard the amount from a PaymentRequirements against AGENT_SPENDING_LIMIT and
  * the mainnet hard cap. Throws with a clear message if either is exceeded.
  */
-function assertAmountWithinLimits(amount: string): void {
-  const parsed = parseFloat(amount);
-  if (isNaN(parsed)) throw new Error(`x402 v2: invalid payment amount "${amount}"`);
+function assertAmountWithinLimits(stroops: bigint): void {
+  const amount = fromStroops(stroops);
 
-  const limit = parseFloat(config.AGENT_SPENDING_LIMIT);
-  if (!isNaN(limit) && parsed > limit) {
+  const limit = tryToStroops(config.AGENT_SPENDING_LIMIT);
+  if (limit !== null && stroops > limit) {
     throw new Error(
       `x402 v2: amount ${amount} exceeds AGENT_SPENDING_LIMIT of ${config.AGENT_SPENDING_LIMIT}`
     );
   }
 
-  if (config.STELLAR_NETWORK === 'mainnet' && parsed > MAINNET_SPENDING_CAP) {
+  if (config.STELLAR_NETWORK === 'mainnet' && stroops > toStroops(String(MAINNET_SPENDING_CAP))) {
     throw new Error(
       `x402 v2: amount ${amount} exceeds mainnet spending cap of ${MAINNET_SPENDING_CAP}`
     );
   }
 
-  if (config.X402_MAX_PRICE && parsed > parseFloat(config.X402_MAX_PRICE)) {
+  if (config.X402_MAX_PRICE && stroops > toStroops(config.X402_MAX_PRICE)) {
     throw new Error(`x402 v2: amount ${amount} exceeds X402_MAX_PRICE of ${config.X402_MAX_PRICE}`);
   }
 }
@@ -197,49 +234,47 @@ function assertPayToAllowed(payTo: string, selfAddress: string): void {
   }
 }
 
-/** Hosts allowed over plain HTTP outside mainnet (local development). */
-const LOCALHOST_HOSTNAMES = new Set(['localhost', '127.0.0.1', '[::1]']);
+// ─── Request body replay ──────────────────────────────────────────────────────
 
 /**
- * Normalise an ALLOWED_X402_ORIGINS entry to a full origin
- * (`scheme://host[:port]`). Bare hostnames mean the default HTTPS origin.
+ * The probe and the paid retry send the same `init`. A `ReadableStream` body is
+ * consumed by the probe, so it is read into memory up front (capped at
+ * MAX_BUFFERED_BODY_BYTES) and both requests send the buffered bytes. Other
+ * body types (string, Buffer/ArrayBuffer, Blob, FormData, URLSearchParams) are
+ * replayable and passed through unchanged.
  */
-function normalizeOrigin(entry: string): string {
-  const withScheme = entry.includes('://') ? entry : `https://${entry}`;
-  try {
-    return new URL(withScheme).origin;
-  } catch {
-    return entry;
-  }
-}
+async function toReplayableInit(init?: RequestInit): Promise<RequestInit | undefined> {
+  const body = init?.body;
+  if (!(body instanceof ReadableStream)) return init;
 
-/**
- * Guard the resource URL before any request is made: it must be HTTPS (plain
- * HTTP only for localhost off mainnet) and, when ALLOWED_X402_ORIGINS is set,
- * its full origin (scheme, host and port) must be listed.
- */
-function assertOriginAllowed(url: URL): void {
-  if (url.protocol !== 'https:') {
-    const devLocalhost =
-      url.protocol === 'http:' &&
-      LOCALHOST_HOSTNAMES.has(url.hostname) &&
-      config.STELLAR_NETWORK !== 'mainnet';
-    if (!devLocalhost) {
-      throw new Error(`x402 v2: refusing non-HTTPS resource origin: ${url.origin}`);
+  const reader = (body as ReadableStream<Uint8Array>).getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    total += value.byteLength;
+    if (total > MAX_BUFFERED_BODY_BYTES) {
+      await reader.cancel();
+      throw new Error(
+        `x402 v2: stream request body exceeds ${MAX_BUFFERED_BODY_BYTES} bytes; ` +
+          `pass a string, Buffer or FormData body instead`
+      );
     }
+    chunks.push(value);
   }
 
-  if (config.ALLOWED_X402_ORIGINS) {
-    const allowedOrigins = new Set(
-      config.ALLOWED_X402_ORIGINS.split(',')
-        .map((o) => o.trim())
-        .filter((o) => o.length > 0)
-        .map(normalizeOrigin)
-    );
-    if (!allowedOrigins.has(url.origin)) {
-      throw new Error(`x402 v2: untrusted resource origin: ${url.origin}`);
-    }
+  const buffered = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    buffered.set(chunk, offset);
+    offset += chunk.byteLength;
   }
+
+  // `duplex` is only meaningful for stream bodies.
+  const replayable: RequestInit & { duplex?: string } = { ...init, body: buffered };
+  delete replayable.duplex;
+  return replayable;
 }
 
 // ─── Requirement selection ────────────────────────────────────────────────────
@@ -261,8 +296,8 @@ function selectRequirements(
     if (req.scheme !== 'exact') continue;
     if (req.network !== agentNetwork && req.network !== 'stellar:*') continue;
 
-    // req.asset is a SAC contract address (C…) or a CODE:ISSUER entry for
-    // non-default assets listed in X402_ALLOWED_ASSETS.
+    // req.asset is a SAC contract address (C…); `allowed` holds the SAC ids of
+    // the default asset and every asset listed in X402_ALLOWED_ASSETS.
     if (allowed.has(req.asset) || allowed.has(req.asset.toUpperCase())) return req;
 
     // Fallback: accept the default asset contract on this network.
@@ -341,16 +376,19 @@ export class X402FetchClient {
    *
    * @param url - Target URL.
    * @param init - Optional RequestInit forwarded to both the probe and paid requests.
+   *   Bodies should be string, Buffer or FormData; a `ReadableStream` body is
+   *   buffered (up to 1 MiB) so the paid retry can resend it.
    * @returns The final response and optional settlement details.
    */
   async fetch(url: string | URL, init?: RequestInit): Promise<X402FetchResult> {
     const urlStr = url instanceof URL ? url.toString() : url;
+    const replayInit = await toReplayableInit(init);
 
     // ── 0. Origin guard (before any request leaves the agent) ────────────────
     assertOriginAllowed(new URL(urlStr));
 
     // ── 1. Probe request ─────────────────────────────────────────────────────
-    const probeResponse = await globalThis.fetch(urlStr, init);
+    const probeResponse = await globalThis.fetch(urlStr, replayInit);
 
     if (probeResponse.status !== 402) {
       return { response: probeResponse };
@@ -386,11 +424,15 @@ export class X402FetchClient {
     }
 
     // ── 4. Pre-payment guards (before reserving or signing) ──────────────────
-    assertAmountWithinLimits(chosen.amount);
+    const amountStroops = atomicAmountToStroops(chosen.amount);
+    assertAmountWithinLimits(amountStroops);
     assertPayToAllowed(chosen.payTo, this.agentAddress);
 
     // ── 5. Reserve spend ─────────────────────────────────────────────────────
-    const reservationId = spendingTracker.reserve(chosen.amount);
+    const reservationId = spendingTracker.reserve(
+      chosen.amount,
+      assetKeyForRequirement(chosen.asset)
+    );
 
     let paymentPayload;
     try {
@@ -410,12 +452,9 @@ export class X402FetchClient {
     const paymentHeaders = this.httpClient.encodePaymentSignatureHeader(paymentPayload);
 
     const paidResponse = await globalThis.fetch(urlStr, {
-      ...init,
-      // Never follow a redirect with the payment header attached: it could
-      // forward the signed payment to another origin.
-      redirect: 'manual',
+      ...replayInit,
       headers: {
-        ...(init?.headers as Record<string, string> | undefined),
+        ...(replayInit?.headers as Record<string, string> | undefined),
         ...paymentHeaders,
       },
     });
@@ -433,7 +472,9 @@ export class X402FetchClient {
       // processPaymentResult failing is non-fatal; we already have the response.
     }
 
-    const settled = paidResponse.status === 200 && settlement?.success === true;
+    // Funds leave once the facilitator settles, even if the resource server
+    // then errors, so commit on settlement independent of the HTTP status.
+    const settled = settlement?.success === true || !!settlement?.transaction;
 
     if (settled) {
       spendingTracker.commit(reservationId);
@@ -441,6 +482,12 @@ export class X402FetchClient {
         { url: urlStr, amount: chosen.amount, asset: chosen.asset, network: chosen.network },
         'x402 v2 payment settled'
       );
+      if (paidResponse.status !== 200) {
+        log.warn(
+          { url: urlStr, status: paidResponse.status, transaction: settlement?.transaction },
+          'x402 v2 payment settled but the paid request did not return 200; spend committed'
+        );
+      }
     } else {
       spendingTracker.release(reservationId);
       if (paidResponse.status !== 200) {

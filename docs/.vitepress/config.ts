@@ -35,7 +35,8 @@ export default defineConfig({
           items: [
             { text: 'Architecture', link: '/guide/architecture' },
             { text: 'Agent Configuration', link: '/guide/agent-config' },
-            { text: 'Tools System', link: '/guide/tools' }
+            { text: 'Tools System', link: '/guide/tools' },
+            { text: 'MCP Server', link: '/guide/mcp' }
           ]
         },
         {
