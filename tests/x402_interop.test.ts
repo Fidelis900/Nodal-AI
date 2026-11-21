@@ -8,6 +8,7 @@
 
 import { describe, it, expect, vi, beforeEach, afterEach, beforeAll, afterAll } from 'vitest';
 import { randomUUID } from 'crypto';
+import { Asset, Networks } from '@stellar/stellar-sdk';
 import type { Keypair } from '@stellar/stellar-sdk';
 import { config, AgentConfig } from '../backend/config';
 import { X402PaymentTool } from '../backend/tools/X402PaymentTool';
@@ -180,6 +181,25 @@ function createValidChallenge(overrides: Record<string, unknown> = {}): any {
 }
 
 const PAID_URL = 'https://api.example.com/data';
+const EURC_ISSUER = 'GDHU6WRG4IEQXM5NZ4BMPKOXHW76MZM4Y2IEMFDVXBSDP6SJY4ITNPP2';
+const EURC_KEY = `EURC:${EURC_ISSUER}`;
+const USDC_KEY = 'USDC:GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN';
+
+/** Temporarily override mutable config fields for one test. */
+async function withConfig(
+  overrides: Partial<Record<keyof AgentConfig, unknown>>,
+  fn: () => Promise<void>
+): Promise<void> {
+  const mutable = config as unknown as Record<string, unknown>;
+  const original: Record<string, unknown> = {};
+  for (const key of Object.keys(overrides)) original[key] = mutable[key];
+  Object.assign(mutable, overrides);
+  try {
+    await fn();
+  } finally {
+    Object.assign(mutable, original);
+  }
+}
 const AGENT_ADDRESS = 'GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5';
 
 function requirement(overrides: Record<string, unknown> = {}): Record<string, unknown> {
@@ -187,7 +207,7 @@ function requirement(overrides: Record<string, unknown> = {}): Record<string, un
     scheme: 'exact',
     network: 'stellar:testnet',
     asset: config.X402_ASSET_CONTRACT,
-    amount: '1.5',
+    amount: '15000000', // atomic units: 1.5 USDC at 7 decimals
     payTo: createValidChallenge().payTo,
     ...overrides,
   };
@@ -308,9 +328,9 @@ describe('x402 v2 Interoperability', () => {
     it('chooses the exact-scheme offer on the agent network from accepts', async () => {
       httpClient.getPaymentRequiredResponse.mockReturnValue({
         accepts: [
-          requirement({ network: 'stellar:pubnet', amount: '9' }),
-          requirement({ scheme: 'upto', amount: '8' }),
-          requirement({ amount: '2' }),
+          requirement({ network: 'stellar:pubnet', amount: '90000000' }),
+          requirement({ scheme: 'upto', amount: '80000000' }),
+          requirement({ amount: '20000000' }),
         ],
       });
       stubPaidServer();
@@ -354,6 +374,85 @@ describe('x402 v2 Interoperability', () => {
       expect(httpClient.createPaymentPayload).not.toHaveBeenCalled();
     });
 
+    it('reserves 0.01 USDC for an atomic 100000 requirement under a 1 USDC limit', async () => {
+      const mutable = config as unknown as { AGENT_SPENDING_LIMIT: string };
+      const original = mutable.AGENT_SPENDING_LIMIT;
+      mutable.AGENT_SPENDING_LIMIT = '1';
+      try {
+        // 0.01 USDC at 7 decimals
+        httpClient.getPaymentRequiredResponse.mockReturnValue({
+          accepts: [requirement({ amount: '100000' })],
+        });
+        stubPaidServer();
+
+        const { settlement } = await buyer().fetch(PAID_URL);
+
+        expect(settlement?.success).toBe(true);
+        expect(spendingTracker.total()).toBe(0.01);
+      } finally {
+        mutable.AGENT_SPENDING_LIMIT = original;
+      }
+    });
+
+    it('rejects an atomic amount above AGENT_SPENDING_LIMIT', async () => {
+      httpClient.getPaymentRequiredResponse.mockReturnValue({
+        accepts: [requirement({ amount: '1000000001' })], // 100.0000001 USDC
+      });
+      stubPaidServer();
+
+      await expect(buyer().fetch(PAID_URL)).rejects.toThrow(/exceeds AGENT_SPENDING_LIMIT/);
+
+      expect(httpClient.createPaymentPayload).not.toHaveBeenCalled();
+      expect(spendingTracker.total()).toBe(0);
+    });
+
+    describe('X402_ALLOWED_ASSETS', () => {
+      const ISSUER = 'GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN';
+      const EURC_CONTRACT = new Asset('EURC', ISSUER).contractId(Networks.TESTNET);
+      const XLM_CONTRACT = Asset.native().contractId(Networks.TESTNET);
+      const mutable = config as unknown as { X402_ALLOWED_ASSETS: string | undefined };
+
+      afterEach(() => {
+        mutable.X402_ALLOWED_ASSETS = undefined;
+      });
+
+      it('selects a second allowed CODE:ISSUER asset by its SAC contract id', async () => {
+        mutable.X402_ALLOWED_ASSETS = `EURC:${ISSUER}`;
+        httpClient.getPaymentRequiredResponse.mockReturnValue({
+          accepts: [requirement({ asset: EURC_CONTRACT })],
+        });
+        stubPaidServer();
+
+        const { settlement } = await buyer().fetch(PAID_URL);
+
+        expect(settlement?.success).toBe(true);
+        expect(httpClient.createPaymentPayload).toHaveBeenCalled();
+      });
+
+      it('maps XLM to the native SAC', async () => {
+        mutable.X402_ALLOWED_ASSETS = 'XLM';
+        httpClient.getPaymentRequiredResponse.mockReturnValue({
+          accepts: [requirement({ asset: XLM_CONTRACT })],
+        });
+        stubPaidServer();
+
+        const { settlement } = await buyer().fetch(PAID_URL);
+
+        expect(settlement?.success).toBe(true);
+      });
+
+      it('still refuses an asset that is not on the allowlist', async () => {
+        mutable.X402_ALLOWED_ASSETS = 'XLM';
+        httpClient.getPaymentRequiredResponse.mockReturnValue({
+          accepts: [requirement({ asset: EURC_CONTRACT })],
+        });
+        stubPaidServer();
+
+        await expect(buyer().fetch(PAID_URL)).rejects.toThrow(/no compatible payment option/);
+        expect(httpClient.createPaymentPayload).not.toHaveBeenCalled();
+      });
+    });
+
     it('releases the reservation when the paid request does not settle', async () => {
       httpClient.processPaymentResult.mockRejectedValue(new Error('no settlement header'));
       stubPaidServer(500);
@@ -364,6 +463,28 @@ describe('x402 v2 Interoperability', () => {
       expect(spendingTracker.total()).toBe(0);
     });
 
+    // #924: settlement, not the HTTP status, decides whether money left.
+    it('commits the spend when settlement succeeded but the server returned 500', async () => {
+      httpClient.processPaymentResult.mockResolvedValue({
+        settleResponse: { success: true, transaction: 'abc123' },
+      });
+      stubPaidServer(500);
+
+      const { response } = await buyer().fetch(PAID_URL);
+
+      expect(response.status).toBe(500);
+      expect(spendingTracker.total()).toBeCloseTo(1.5);
+    });
+
+    it('releases the reservation when no settlement is reported', async () => {
+      httpClient.processPaymentResult.mockResolvedValue({ settleResponse: undefined });
+      stubPaidServer(200);
+
+      await buyer().fetch(PAID_URL);
+
+      expect(spendingTracker.total()).toBe(0);
+    });
+
     it('releases the reservation when signing fails', async () => {
       httpClient.createPaymentPayload.mockRejectedValue(new Error('signer offline'));
       stubPaidServer();
@@ -371,6 +492,88 @@ describe('x402 v2 Interoperability', () => {
       await expect(buyer().fetch(PAID_URL)).rejects.toThrow(/failed to create payment payload/);
 
       expect(spendingTracker.total()).toBe(0);
+    });
+
+    // #926: a stream body is consumed by the probe, so it must be buffered.
+    it('pays a POST with a stream body and delivers the body on the paid retry', async () => {
+      const fetchMock = stubPaidServer();
+      const body = new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(new TextEncoder().encode('{"query":'));
+          controller.enqueue(new TextEncoder().encode('"weather"}'));
+          controller.close();
+        },
+      });
+
+      const { response } = await buyer().fetch(PAID_URL, {
+        method: 'POST',
+        body,
+        duplex: 'half',
+      } as RequestInit);
+
+      expect(response.status).toBe(200);
+      const decode = (b: unknown): string => new TextDecoder().decode(b as Uint8Array);
+      expect(decode(fetchMock.mock.calls[0]![1].body)).toBe('{"query":"weather"}');
+      expect(decode(fetchMock.mock.calls[1]![1].body)).toBe('{"query":"weather"}');
+      expect(fetchMock.mock.calls[1]![1].method).toBe('POST');
+      expect(spendingTracker.total()).toBeCloseTo(1.5);
+    });
+
+    // #921: the reservation is keyed by the asset actually paid.
+    it('reserves a payment in another allowed asset under that asset key', async () => {
+      httpClient.getPaymentRequiredResponse.mockReturnValue({
+        accepts: [requirement({ asset: EURC_KEY })],
+      });
+      stubPaidServer();
+
+      await withConfig(
+        {
+          X402_ALLOWED_ASSETS: EURC_KEY,
+          SPENDING_LIMITS_MAP: new Map([
+            [USDC_KEY, '100'],
+            [EURC_KEY, '100'],
+          ]),
+        },
+        async () => {
+          await buyer().fetch(PAID_URL);
+        }
+      );
+
+      expect(spendingTracker.totalForAsset(EURC_KEY)).toBe(15_000_000n);
+      expect(spendingTracker.totalForAsset(USDC_KEY)).toBe(0n);
+    });
+
+    it('denies an asset missing from SPENDING_LIMITS unless unknown assets are allowed', async () => {
+      httpClient.getPaymentRequiredResponse.mockReturnValue({
+        accepts: [requirement({ asset: EURC_KEY })],
+      });
+
+      await withConfig(
+        {
+          X402_ALLOWED_ASSETS: EURC_KEY,
+          SPENDING_LIMITS_MAP: new Map([[USDC_KEY, '100']]),
+          SPENDING_LIMITS_ALLOW_UNKNOWN: false,
+        },
+        async () => {
+          stubPaidServer();
+          await expect(buyer().fetch(PAID_URL)).rejects.toThrow(/SPENDING_LIMITS_ALLOW_UNKNOWN/);
+          expect(httpClient.createPaymentPayload).not.toHaveBeenCalled();
+        }
+      );
+
+      await withConfig(
+        {
+          X402_ALLOWED_ASSETS: EURC_KEY,
+          SPENDING_LIMITS_MAP: new Map([[USDC_KEY, '100']]),
+          SPENDING_LIMITS_ALLOW_UNKNOWN: true,
+        },
+        async () => {
+          stubPaidServer();
+          await buyer().fetch(PAID_URL);
+        }
+      );
+
+      expect(spendingTracker.totalForAsset(EURC_KEY)).toBe(15_000_000n);
     });
 
     it('needs no facilitator: settlement is the seller side of the protocol', async () => {

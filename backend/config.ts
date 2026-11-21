@@ -266,6 +266,17 @@ export const EnvSchema = z.object({
 
   // Nano node RPC endpoint used by NanoPaymentTool.
   NANO_RPC_URL: z.string().url().default('http://127.0.0.1:7076'),
+  // Nano signing seed (#975). Loaded from env or AWS Secrets Manager, never
+  // from a task payload. Required at startup when NANO_ENABLED=true.
+  NANO_ENABLED: z
+    .enum(['true', 'false'])
+    .default('false')
+    .transform((v) => v === 'true'),
+  NANO_SEED: z
+    .string()
+    .regex(/^[0-9A-Fa-f]{64}$/, 'NANO_SEED must be a 64-character hex seed')
+    .optional(),
+  NANO_SEED_ARN: z.string().optional(),
 
   // MCP server
   MCP_ALLOW_PAYMENTS: z
@@ -274,6 +285,16 @@ export const EnvSchema = z.object({
     .transform((v) => v === 'true'),
   MCP_TRANSPORT: z.enum(['stdio', 'http']).default('stdio'),
   MCP_PORT: z.coerce.number().int().min(1).max(65535).default(3001),
+  // Bearer token required by all MCP HTTP routes. When MCP_ALLOW_PAYMENTS is
+  // true the server refuses to start without this token (see issue #911).
+  MCP_API_TOKEN: z.string().min(1).optional(),
+  // Host/IP the MCP HTTP server binds to. Defaults to 127.0.0.1 (loopback
+  // only). Set to 0.0.0.0 only when the MCP server must be reachable across
+  // the network and you have external auth/firewall in place.
+  MCP_HOST: z.string().default('127.0.0.1'),
+  // Maximum JSON body size accepted by the MCP HTTP endpoint (in bytes).
+  // Requests that exceed this limit are rejected with 413. Defaults to 1 MiB.
+  MCP_MAX_BODY_BYTES: z.coerce.number().int().min(1024).default(1_048_576),
 
   // Contract event listener polling interval in milliseconds.
   CONTRACT_EVENT_POLL_MS: z.coerce.number().int().min(100).optional(),
@@ -668,6 +689,21 @@ export interface AgentConfig {
    */
   readonly MCP_PORT: number;
   /**
+   * Bearer token required on all MCP HTTP routes. When MCP_ALLOW_PAYMENTS is
+   * true the server refuses to start if this is unset. See issue #911.
+   */
+  readonly MCP_API_TOKEN?: string | undefined;
+  /**
+   * Host the MCP HTTP server binds to. Defaults to "127.0.0.1" (loopback).
+   * Set to "0.0.0.0" only if external auth/firewall is in place.
+   */
+  readonly MCP_HOST: string;
+  /**
+   * Maximum JSON body size (bytes) accepted by the MCP HTTP endpoint.
+   * Requests exceeding this limit receive a 413 response. Defaults to 1 MiB.
+   */
+  readonly MCP_MAX_BODY_BYTES: number;
+  /**
    * Port for the health-check HTTP server.
    * Validated by EnvSchema to be an integer between 1 and 65535.
    * Defaults to 3000.
@@ -676,6 +712,9 @@ export interface AgentConfig {
 
   /** Nano node RPC endpoint used by NanoPaymentTool (default: http://127.0.0.1:7076). */
   readonly NANO_RPC_URL: string;
+  /** Whether the nano_payment task is enabled (requires NANO_SEED or NANO_SEED_ARN). */
+  readonly NANO_ENABLED: boolean;
+  readonly NANO_SEED_ARN?: string | undefined;
   readonly CONTRACT_EVENT_POLL_MS?: number | undefined;
   readonly WEBHOOK_URL?: string | undefined;
   readonly WEBHOOK_SECRET?: string | undefined;
@@ -895,6 +934,20 @@ function parseConfigAndDerive(
     );
   }
 
+  // ── MCP HTTP security guard ─────────────────────────────────────────────────
+  // MCP_ALLOW_PAYMENTS=true exposes value-moving tools over HTTP. Refusing to
+  // start without a bearer token prevents an open endpoint from draining the
+  // agent account. See issue #911.
+  if (raw.MCP_ALLOW_PAYMENTS && raw.MCP_TRANSPORT === 'http' && !raw.MCP_API_TOKEN) {
+    process.stderr.write(
+      `❌ [Config] MCP_API_TOKEN is required when MCP_ALLOW_PAYMENTS=true and ` +
+        `MCP_TRANSPORT=http. ` +
+        `An unauthenticated HTTP MCP endpoint with payment tools enabled would ` +
+        `allow anyone who can reach the port to move funds from the agent account.\n`
+    );
+    process.exit(1);
+  }
+
   // ── Payment destination policy ─────────────────────────────────────────────
   const paymentDestinations = (raw.PAYMENT_DESTINATIONS ?? '')
     .split(',')
@@ -962,8 +1015,17 @@ function parseConfigAndDerive(
     WEBHOOK_SECRET,
     DATABASE_URL,
     LLM_API_KEY: _llmApiKey, // Secret - never exposed on config
+    NANO_SEED: nanoSeed, // Secret - exposed only through getNanoSeed()
     ...rest
   } = raw;
+
+  if (raw.NANO_ENABLED && !nanoSeed) {
+    process.stderr.write(
+      '❌ [Config] NANO_ENABLED=true requires NANO_SEED or NANO_SEED_ARN.\n'
+    );
+    process.exit(1);
+  }
+  _nanoSeed = nanoSeed;
 
   const rpcTimeoutMs = raw.RPC_TIMEOUT_MS ?? raw.RETRY_DELAY_MS * raw.MAX_RETRIES * 2;
 
@@ -1033,7 +1095,18 @@ function loadConfigSync(): AgentConfig {
   return parseConfigAndDerive();
 }
 
+let _nanoSeed: string | undefined;
+
+/** The Nano signing seed from NANO_SEED / NANO_SEED_ARN, if configured. */
+export function getNanoSeed(): string | undefined {
+  return _nanoSeed;
+}
+
 function assertSecretConfigCompatibility(): void {
+  if (process.env.NANO_SEED && process.env.NANO_SEED_ARN) {
+    process.stderr.write('❌ [Config] Cannot specify both NANO_SEED and NANO_SEED_ARN.\n');
+    process.exit(1);
+  }
   if (process.env.AGENT_SECRET_KEY && process.env.AGENT_SECRET_KEY_ARN) {
     process.stderr.write(
       '❌ [Config] Cannot specify both AGENT_SECRET_KEY and AGENT_SECRET_KEY_ARN.\n'
@@ -1077,6 +1150,17 @@ export async function loadConfig(): Promise<AgentConfig> {
     }
   }
 
+  if (process.env.NANO_SEED_ARN) {
+    try {
+      process.env.NANO_SEED = (await fetchSecretFromArn(process.env.NANO_SEED_ARN)).trim();
+    } catch (err: any) {
+      process.stderr.write(
+        `❌ [Config] Failed to fetch NANO_SEED_ARN from AWS Secrets Manager: ${err.message}\n`
+      );
+      process.exit(1);
+    }
+  }
+
   return parseConfigAndDerive();
 }
 
@@ -1091,7 +1175,11 @@ if (process.env.AGENT_SECRET_KEY && process.env.AGENT_SECRET_KEY_ARN) {
   process.stderr.write(
     '❌ [Config] Cannot specify both AGENT_SECRET_KEY and AGENT_SECRET_KEY_ARN.\n'
   );
-} else if (process.env.AGENT_SECRET_KEY && !process.env.AGENT_SECRET_KEY_ARN) {
+} else if (
+  process.env.AGENT_SECRET_KEY &&
+  !process.env.AGENT_SECRET_KEY_ARN &&
+  !process.env.NANO_SEED_ARN
+) {
   try {
     _config = loadConfigSync();
   } catch (err: any) {
