@@ -69,6 +69,7 @@ pub enum DataKey {
     Window,
     WindowStart,
     Spent,
+    Frozen,
 }
 
 // ─── Policy State ─────────────────────────────────────────────────────────────
@@ -79,11 +80,13 @@ pub struct PolicyState {
     // NOTE: This struct is part of the `agent_policy` crate which should be included in the workspace defined at `contracts/Cargo.toml`.
 
     pub owner: Address,
+    pub agent_key: BytesN<32>,
     pub token: Address,
     pub limit: i128,
     pub window: u64,
     pub window_start: u64,
     pub spent: i128,
+    pub frozen: bool,
 }
 
 // ─── Contract Errors ──────────────────────────────────────────────────────────
@@ -102,6 +105,8 @@ pub enum PolicyError {
     OverLimit = 4,
     /// The agent key is not allowed to authorise this call.
     ForbiddenContext = 5,
+    /// Agent spending is currently frozen.
+    Frozen = 6,
 }
 
 // ─── Contract ─────────────────────────────────────────────────────────────────
@@ -147,6 +152,7 @@ impl AgentPolicyAccount {
         env.storage().instance().set(&DataKey::Window, &window);
         env.storage().instance().set(&DataKey::WindowStart, &now);
         env.storage().instance().set(&DataKey::Spent, &0i128);
+        env.storage().instance().set(&DataKey::Frozen, &false);
 
         env.events().publish(
             (
@@ -180,6 +186,42 @@ impl AgentPolicyAccount {
         );
     }
 
+    /// Freeze agent spending. Only callable by the owner.
+    pub fn freeze(env: Env) {
+        let owner = Self::owner(&env);
+        owner.require_auth();
+        env.storage().instance().set(&DataKey::Frozen, &true);
+        env.events().publish(
+            (Symbol::new(&env, "policy"), Symbol::new(&env, "frozen")),
+            (),
+        );
+    }
+
+    /// Unfreeze agent spending. Only callable by the owner.
+    pub fn unfreeze(env: Env) {
+        let owner = Self::owner(&env);
+        owner.require_auth();
+        env.storage().instance().set(&DataKey::Frozen, &false);
+        env.events().publish(
+            (Symbol::new(&env, "policy"), Symbol::new(&env, "unfrozen")),
+            (),
+        );
+    }
+
+    /// Replace the agent signing key. Only callable by the owner.
+    pub fn rotate_agent_key(env: Env, new_key: BytesN<32>) {
+        let owner = Self::owner(&env);
+        owner.require_auth();
+        env.storage().instance().set(&DataKey::AgentKey, &new_key);
+        env.events().publish(
+            (
+                Symbol::new(&env, "policy"),
+                Symbol::new(&env, "agent_key_rotated"),
+            ),
+            new_key,
+        );
+    }
+
     /// Return the current policy and window accounting.
     ///
     /// # Panics
@@ -187,6 +229,11 @@ impl AgentPolicyAccount {
     pub fn get_policy(env: Env) -> PolicyState {
         PolicyState {
             owner: Self::owner(&env),
+            agent_key: env
+                .storage()
+                .instance()
+                .get(&DataKey::AgentKey)
+                .expect("policy: state corrupted"),
             token: env
                 .storage()
                 .instance()
@@ -211,6 +258,11 @@ impl AgentPolicyAccount {
                 .storage()
                 .instance()
                 .get(&DataKey::Spent)
+                .expect("policy: state corrupted"),
+            frozen: env
+                .storage()
+                .instance()
+                .get(&DataKey::Frozen)
                 .expect("policy: state corrupted"),
         }
     }
@@ -303,6 +355,15 @@ impl CustomAccountInterface for AgentPolicyAccount {
 
         if total == 0 {
             return Ok(());
+        }
+
+        let frozen: bool = env
+            .storage()
+            .instance()
+            .get(&DataKey::Frozen)
+            .ok_or(PolicyError::NotInitialized)?;
+        if frozen {
+            return Err(PolicyError::Frozen);
         }
 
         let limit: i128 = env
