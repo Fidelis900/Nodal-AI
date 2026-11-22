@@ -49,32 +49,6 @@
 
 import { Asset, Networks, xdr } from '@stellar/stellar-sdk';
 
-// Shared HTTP fetch helper with configurable timeout.
-export interface HttpFetchOptions {
-  /** Timeout in milliseconds (default from HTTP_TIMEOUT_MS env or 5000). */
-  timeoutMs?: number;
-  /** Additional fetch init options. */
-  init?: RequestInit;
-}
-
-/**
- * Perform a fetch with an AbortSignal timeout.
- * All backend outbound HTTP calls should use this instead of raw fetch.
- */
-export async function httpFetch(url: string, options: HttpFetchOptions = {}): Promise<Response> {
-  const { timeoutMs = Number(process.env.HTTP_TIMEOUT_MS) || 5000, init = {} } = options;
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), timeoutMs);
-  try {
-    const response = await fetch(url, { ...init, signal: controller.signal });
-    clearTimeout(timeout);
-    return response;
-  } catch (err) {
-    clearTimeout(timeout);
-    throw err;
-  }
-}
-
 import { x402Client, x402HTTPClient } from '@x402/core/client';
 import type { PaymentRequired, PaymentRequirements, SettleResponse } from '@x402/core/types';
 import { ExactStellarScheme } from '@x402/stellar/exact/client';
@@ -85,7 +59,7 @@ import { createLogger } from '../utils/logger';
 import { fromStroops, toStroops, tryToStroops } from '../utils/amount';
 import { toCaip2 } from '../network';
 import { assetKey, spendingTracker } from '../spending_tracker';
-import { PolicyViolationError } from '../errors';
+import { PolicyViolationError, RpcUnavailableError } from '../errors';
 import type { Signer } from '../signer';
 import { resolveNetworkPassphrase, sorobanServer } from '../rpc_client';
 
@@ -244,6 +218,30 @@ function assertAmountWithinLimits(stroops: bigint): void {
  * Guard the `payTo` address against PAYMENT_DESTINATION_POLICY.
  * Mirrors the same logic used by StellarPaymentTool / agent.ts.
  */
+/**
+ * Convert a PaymentRequirements amount to stroops. In x402 v2 `amount` is in
+ * the token's smallest unit; the payable assets are Stellar Asset Contracts
+ * wrapping classic assets, which always use 7 decimals, so one atomic unit is
+ * exactly one stroop (0.01 USDC is "100000").
+ */
+function atomicAmountToStroops(amount: string): bigint {
+  if (!/^\d+$/.test(amount)) throw new Error(`x402 v2: invalid payment amount "${amount}"`);
+  return BigInt(amount);
+}
+
+/**
+ * Refuses a resource URL whose hostname is not in `ALLOWED_X402_ORIGINS`.
+ * Unset (default) means any origin is allowed.
+ */
+function assertOriginAllowed(url: URL): void {
+  if (!config.ALLOWED_X402_ORIGINS) return;
+
+  const allowedOrigins = new Set(config.ALLOWED_X402_ORIGINS.split(',').map((o) => o.trim()));
+  if (!allowedOrigins.has(url.hostname)) {
+    throw new Error(`x402 v2: untrusted resource origin: ${url.hostname}`);
+  }
+}
+
 function assertPayToAllowed(payTo: string, selfAddress: string): void {
   if (payTo === selfAddress) {
     throw new Error("x402 v2: payTo cannot be the agent's own address");
@@ -457,7 +455,7 @@ export class X402FetchClient {
 
     // ── 5. Reserve spend ─────────────────────────────────────────────────────
     const reservationId = spendingTracker.reserve(
-      chosen.amount,
+      fromStroops(amountStroops),
       assetKeyForRequirement(chosen.asset)
     );
 

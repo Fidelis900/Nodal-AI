@@ -72,6 +72,137 @@ mod tests {
         assert_eq!(token.balance(&contract_id), 0);
     }
 
+    // Token allowlist (#989): optional, set once before initialize.
+
+    #[test]
+    fn test_initialize_accepts_allowlisted_token() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let depositor = Address::generate(&env);
+        let recipient = Address::generate(&env);
+        let arbiter = Address::generate(&env);
+        let (token_id, token) = create_token(&env, &depositor);
+        StellarAssetClient::new(&env, &token_id).mint(&depositor, &1_000);
+        let contract_id = env.register_contract(None, EscrowContract);
+        let client = EscrowContractClient::new(&env, &contract_id);
+
+        client.set_allowed_tokens(&soroban_sdk::vec![&env, token_id.clone()]);
+        client.initialize(
+            &depositor,
+            &recipient,
+            &arbiter,
+            &token_id,
+            &500,
+            &(env.ledger().timestamp() + EXPIRY_OFFSET),
+        );
+
+        assert_eq!(token.balance(&contract_id), 500);
+    }
+
+    #[test]
+    fn test_initialize_rejects_non_allowlisted_token() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let depositor = Address::generate(&env);
+        let recipient = Address::generate(&env);
+        let arbiter = Address::generate(&env);
+        let (token_id, _token) = create_token(&env, &depositor);
+        StellarAssetClient::new(&env, &token_id).mint(&depositor, &1_000);
+        // A different token, not on the allowlist configured below.
+        let (other_token_id, _) = create_token(&env, &depositor);
+
+        let contract_id = env.register_contract(None, EscrowContract);
+        let client = EscrowContractClient::new(&env, &contract_id);
+
+        client.set_allowed_tokens(&soroban_sdk::vec![&env, other_token_id]);
+
+        let result = outcome(client.try_initialize(
+            &depositor,
+            &recipient,
+            &arbiter,
+            &token_id,
+            &500,
+            &(env.ledger().timestamp() + EXPIRY_OFFSET),
+        ));
+        assert_eq!(
+            result,
+            Err(EscrowError::InvalidToken),
+            "a token outside the configured allowlist must be rejected"
+        );
+    }
+
+    #[test]
+    fn test_initialize_unrestricted_when_allowlist_never_set() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let depositor = Address::generate(&env);
+        let recipient = Address::generate(&env);
+        let arbiter = Address::generate(&env);
+        let (token_id, token) = create_token(&env, &depositor);
+        StellarAssetClient::new(&env, &token_id).mint(&depositor, &1_000);
+        let contract_id = env.register_contract(None, EscrowContract);
+        let client = EscrowContractClient::new(&env, &contract_id);
+
+        assert_eq!(client.get_allowed_tokens(), None);
+        client.initialize(
+            &depositor,
+            &recipient,
+            &arbiter,
+            &token_id,
+            &500,
+            &(env.ledger().timestamp() + EXPIRY_OFFSET),
+        );
+
+        assert_eq!(token.balance(&contract_id), 500);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_set_allowed_tokens_empty_panics() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, EscrowContract);
+        let client = EscrowContractClient::new(&env, &contract_id);
+        client.set_allowed_tokens(&soroban_sdk::vec![&env]);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_set_allowed_tokens_twice_panics() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let depositor = Address::generate(&env);
+        let (token_id, _) = create_token(&env, &depositor);
+        let (other_token_id, _) = create_token(&env, &depositor);
+        let contract_id = env.register_contract(None, EscrowContract);
+        let client = EscrowContractClient::new(&env, &contract_id);
+        client.set_allowed_tokens(&soroban_sdk::vec![&env, token_id]);
+        client.set_allowed_tokens(&soroban_sdk::vec![&env, other_token_id]);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_set_allowed_tokens_after_initialize_panics() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let depositor = Address::generate(&env);
+        let recipient = Address::generate(&env);
+        let arbiter = Address::generate(&env);
+        let (token_id, _) = create_token(&env, &depositor);
+        StellarAssetClient::new(&env, &token_id).mint(&depositor, &1_000);
+        let contract_id = env.register_contract(None, EscrowContract);
+        let client = EscrowContractClient::new(&env, &contract_id);
+        client.initialize(
+            &depositor,
+            &recipient,
+            &arbiter,
+            &token_id,
+            &500,
+            &(env.ledger().timestamp() + EXPIRY_OFFSET),
+        );
+        client.set_allowed_tokens(&soroban_sdk::vec![&env, token_id]);
+    }
+
     // 3. initialize with max i128 amount should panic
     #[test]
     #[should_panic]
