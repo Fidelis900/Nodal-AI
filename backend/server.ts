@@ -13,26 +13,32 @@
  *   GET /metrics → Prometheus text exposition (Bearer auth)
  *   GET /approvals → 200 { approvals: PendingApproval[] } (Bearer auth)
  *   POST /approvals/:id { "decision": "approve" | "deny" } → 200 { approval, result? } (Bearer auth)
- *   GET /stream → SSE stream for real-time dashboard updates (Bearer auth)
+ *   POST /stream/ticket → 200 { ticket, expiresInMs } single-use SSE ticket (Bearer auth, #965)
+ *   GET /stream → SSE stream for real-time dashboard updates (Bearer auth, or ?ticket= from
+ *                 POST /stream/ticket — an EventSource cannot set an Authorization header)
  *   POST /admin/pause → 200 { paused: true } halt value-moving tasks (Bearer auth)
  *   POST /admin/resume → 200 { paused: false } resume them (Bearer auth)
  *
  * ADMIN_API_TOKEN is the API bearer token. WEBHOOK_SECRET is still accepted in
  * its place when ADMIN_API_TOKEN is unset, but that fallback is deprecated.
  *
+ * CORS (#966): every route answers an OPTIONS preflight, and
+ * Access-Control-Allow-Origin is set when the request's Origin is listed in
+ * CORS_ALLOWED_ORIGINS. Unset (default) means no CORS at all.
+ *
  * Uses only the Node.js built-in `http` module — no additional dependencies.
  * Port is read from config.HEALTH_PORT (env var HEALTH_PORT, default 3000).
  */
 
 import * as http from 'http';
-import { createHash, timingSafeEqual } from 'crypto';
+import { createHash, randomUUID, timingSafeEqual } from 'crypto';
 import { config, getAdminApiToken } from './config';
-import { getResults } from './persistence';
+import { getResults, type PendingApproval } from './persistence';
 import { horizonServer, sorobanServer } from './rpc_client';
 import { db } from './db/client';
 import { handleError } from './middleware/error_handler';
 import { createLogger } from './utils/logger';
-import { spendingTracker, type PayFiAgent } from './agent';
+import { spendingTracker, type PayFiAgent, type AgentResult } from './agent';
 import { llmUsage } from './ai/llm';
 import { metricsRegistry, renderMetrics, spendingWindowTotal } from './metrics';
 import { pauseAgent, resumeAgent, isPaused } from './kill_switch';
@@ -141,32 +147,21 @@ function tokensMatch(given: string, expected: string): boolean {
  * Returns true if the request passes Bearer-token authentication.
  * When no API token is configured, requests are allowed on testnet/futurenet
  * only; on mainnet they are always rejected.
- * Also checks for token in URL query parameter (for SSE support).
+ *
+ * Does NOT accept the token from a URL query parameter (#965) — that leaks it
+ * into proxy/access logs and browser history. GET /stream, the one route an
+ * EventSource (which cannot set an Authorization header) must reach, instead
+ * uses a short-lived single-use ticket; see {@link isStreamAuthenticated}.
  */
 function isAuthenticated(req: http.IncomingMessage): boolean {
   const secret = apiToken();
   if (!secret) return config.STELLAR_NETWORK !== 'mainnet';
 
-  // Check Authorization header first
   const auth = req.headers['authorization'];
   if (auth) {
     const [scheme, token] = auth.split(' ');
     if (scheme?.toLowerCase() === 'bearer' && token !== undefined && tokensMatch(token, secret)) {
       return true;
-    }
-  }
-
-  // Check URL query parameter (for SSE, which doesn't support custom headers)
-  const url = req.url;
-  if (url) {
-    try {
-      const parsed = new URL(url, `http://${req.headers.host ?? 'localhost'}`);
-      const token = parsed.searchParams.get('token');
-      if (token && tokensMatch(token, secret)) {
-        return true;
-      }
-    } catch {
-      // Invalid URL, continue to return false
     }
   }
 
@@ -181,6 +176,95 @@ function isAuthenticated(req: http.IncomingMessage): boolean {
  */
 function isStrictlyAuthenticated(req: http.IncomingMessage): boolean {
   return Boolean(apiToken()) && isAuthenticated(req);
+}
+
+// ─── SSE stream tickets (#965) ─────────────────────────────────────────────
+//
+// An EventSource cannot set an Authorization header, so GET /stream cannot
+// use ordinary Bearer auth. POST /stream/ticket (which *can* use a header,
+// since it's a normal fetch) exchanges the admin token for a short-lived,
+// single-use ticket that's safe to put in the stream URL: it's useless to
+// anyone who captures it from a log after STREAM_TICKET_TTL_MS, and useless
+// a second time to anyone who captures it before that.
+
+const STREAM_TICKET_TTL_MS = 60_000;
+const streamTickets = new Map<string, number>(); // ticket -> expiresAt (epoch ms)
+
+function pruneExpiredStreamTickets(now: number): void {
+  for (const [ticket, expiresAt] of streamTickets) {
+    if (expiresAt <= now) streamTickets.delete(ticket);
+  }
+}
+
+/** Issues a new ticket, valid for one GET /stream connection within STREAM_TICKET_TTL_MS. */
+function issueStreamTicket(): string {
+  const now = Date.now();
+  pruneExpiredStreamTickets(now);
+  const ticket = randomUUID();
+  streamTickets.set(ticket, now + STREAM_TICKET_TTL_MS);
+  return ticket;
+}
+
+/** Consumes `ticket` if (and only if) it exists and has not expired. Always single-use. */
+function consumeStreamTicket(ticket: string): boolean {
+  const expiresAt = streamTickets.get(ticket);
+  streamTickets.delete(ticket); // single-use: gone whether or not it was valid
+  return expiresAt !== undefined && expiresAt > Date.now();
+}
+
+/**
+ * Auth check for GET /stream only: a normal Bearer header (for non-browser
+ * clients that can set one), or a valid `ticket` query parameter minted by
+ * POST /stream/ticket. Never a raw token in the query string (#965).
+ */
+function isStreamAuthenticated(req: http.IncomingMessage): boolean {
+  if (isAuthenticated(req)) return true;
+
+  const url = req.url;
+  if (!url) return false;
+  try {
+    const parsed = new URL(url, `http://${req.headers.host ?? 'localhost'}`);
+    const ticket = parsed.searchParams.get('ticket');
+    return !!ticket && consumeStreamTicket(ticket);
+  } catch {
+    return false;
+  }
+}
+
+// ─── CORS (#966) ────────────────────────────────────────────────────────────
+//
+// Unset CORS_ALLOWED_ORIGINS (default) means no CORS at all: no
+// Access-Control-* header is ever sent, so a cross-origin browser request
+// simply fails the way it always has. When set, only an exact origin on the
+// list gets the preflight response and the Access-Control-Allow-Origin
+// header — the origin is echoed back, never "*", since this API uses
+// credentials (the Bearer token).
+function corsAllowedOrigins(): Set<string> {
+  if (!config.CORS_ALLOWED_ORIGINS) return new Set();
+  return new Set(config.CORS_ALLOWED_ORIGINS.split(',').map((o) => o.trim()));
+}
+
+/**
+ * Sets CORS headers when `req`'s Origin is allowed, and answers an OPTIONS
+ * preflight directly. Returns true when the caller should stop (the request
+ * was an OPTIONS preflight and has already been answered).
+ */
+function applyCors(req: http.IncomingMessage, res: http.ServerResponse): boolean {
+  const origin = req.headers.origin;
+  if (origin && corsAllowedOrigins().has(origin)) {
+    res.setHeader('Access-Control-Allow-Origin', origin);
+    res.setHeader('Vary', 'Origin');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Authorization, Content-Type');
+  }
+
+  if (req.method === 'OPTIONS') {
+    res.writeHead(204);
+    res.end();
+    return true;
+  }
+
+  return false;
 }
 
 /** One asset's share of the rolling spending window, as reported by GET /spending. */
@@ -223,6 +307,7 @@ const SPENDING_PATH = '/spending';
 const METRICS_PATH = '/metrics';
 const APPROVALS_PATH = '/approvals';
 const STREAM_PATH = '/stream';
+const STREAM_TICKET_PATH = '/stream/ticket';
 const ADMIN_PAUSE_PATH = '/admin/pause';
 const ADMIN_RESUME_PATH = '/admin/resume';
 
@@ -234,6 +319,10 @@ const ADMIN_RESUME_PATH = '/admin/resume';
  */
 export function createHealthServer(agent?: PayFiAgent): http.Server {
   const server = http.createServer((req, res) => {
+    // ── CORS preflight (#966) ─────────────────────────────────────────────
+    // Applied before any route so every path answers OPTIONS the same way.
+    if (applyCors(req, res)) return;
+
     // ── GET /health ────────────────────────────────────────────────────────
     if (req.method === 'GET' && req.url === HEALTH_PATH) {
       // Delegate to the real implementation: it probes Horizon, Soroban and
@@ -351,10 +440,31 @@ export function createHealthServer(agent?: PayFiAgent): http.Server {
       return;
     }
 
+    // ── POST /stream/ticket ────────────────────────────────────────────────
+    // Exchanges a Bearer token (never put in a URL) for a short-lived,
+    // single-use ticket that GET /stream accepts in its query string (#965).
+    if (req.method === 'POST' && req.url === STREAM_TICKET_PATH) {
+      if (!isAuthenticated(req)) {
+        res.writeHead(401, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Unauthorized' }));
+        return;
+      }
+      const body = JSON.stringify({
+        ticket: issueStreamTicket(),
+        expiresInMs: STREAM_TICKET_TTL_MS,
+      });
+      res.writeHead(200, {
+        'Content-Type': 'application/json',
+        'Content-Length': Buffer.byteLength(body),
+      });
+      res.end(body);
+      return;
+    }
+
     // ── GET /stream ────────────────────────────────────────────────────────
     // SSE stream for real-time dashboard updates
-    if (req.method === 'GET' && req.url === STREAM_PATH) {
-      if (!isAuthenticated(req)) {
+    if (req.method === 'GET' && req.url?.split('?')[0] === STREAM_PATH) {
+      if (!isStreamAuthenticated(req)) {
         res.writeHead(401, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ error: 'Unauthorized' }));
         return;
@@ -621,108 +731,171 @@ async function handleApprovalDecision(
   }
 }
 
+// ─── SSE broadcast hub (#967) ───────────────────────────────────────────────
+//
+// One shared poll and one agent-event subscription for the whole process,
+// fanned out to every connected client — not one `setInterval` (each running
+// its own `listApprovals()`, a DB query + an expiry pass) per client. Also:
+//  - forwards the agent's own task:complete/task:failed events, which the
+//    old polling loop never looked at, so the dashboard's task history never
+//    actually streamed live.
+//  - diffs approvals by the *set* of pending ids, not the count, so an
+//    approve + a new approval arriving in the same tick — same count,
+//    different ids — still emits.
+const SSE_POLL_INTERVAL_MS = 2_000;
+const SSE_RETRY_MS = 3_000;
+const MAX_SSE_CLIENTS = 100;
+
+interface SseClient {
+  res: http.ServerResponse;
+  nextEventId: number;
+}
+
+const sseClients = new Set<SseClient>();
+let sseHubAgent: PayFiAgent | undefined;
+let sseHubTimer: ReturnType<typeof setInterval> | undefined;
+let sseTaskListener: ((result: AgentResult) => void) | undefined;
+let lastSseSpendingTotal = 0;
+let lastSseApprovals: PendingApproval[] = [];
+let lastSseApprovalIds = new Set<string>();
+let lastSsePaused = false;
+
+function spendingSnapshot(): Record<string, unknown> {
+  const status = spendingTracker.getWindowStatus();
+  const limit = parseFloat(config.AGENT_SPENDING_LIMIT);
+  return {
+    ...status,
+    limit,
+    percentUsed: status.total > 0 ? (status.total / limit) * 100 : 0,
+  };
+}
+
+function sseSend(client: SseClient, event: string, data: unknown): void {
+  const id = client.nextEventId++;
+  client.res.write(`id: ${id}\n`);
+  client.res.write(`retry: ${SSE_RETRY_MS}\n`);
+  client.res.write(`event: ${event}\n`);
+  client.res.write(`data: ${JSON.stringify(data)}\n\n`);
+}
+
+function sseBroadcast(event: string, data: unknown): void {
+  for (const client of sseClients) sseSend(client, event, data);
+}
+
+function setsEqual(a: Set<string>, b: Set<string>): boolean {
+  if (a.size !== b.size) return false;
+  for (const value of a) if (!b.has(value)) return false;
+  return true;
+}
+
+/** One shared tick: at most one `listApprovals()` / spending read, regardless of client count. */
+function pollSseHub(): void {
+  try {
+    const currentSpendingTotal = spendingTracker.total();
+    if (currentSpendingTotal !== lastSseSpendingTotal) {
+      lastSseSpendingTotal = currentSpendingTotal;
+      sseBroadcast('spending', { ...spendingSnapshot(), timestamp: new Date().toISOString() });
+    }
+
+    if (sseHubAgent) {
+      const currentApprovals = sseHubAgent.listApprovals();
+      const currentIds = new Set(currentApprovals.map((a) => a.id));
+      if (!setsEqual(currentIds, lastSseApprovalIds)) {
+        lastSseApprovals = currentApprovals;
+        lastSseApprovalIds = currentIds;
+        sseBroadcast('approvals', {
+          approvals: currentApprovals,
+          timestamp: new Date().toISOString(),
+        });
+      }
+    }
+
+    const currentPaused = isPaused();
+    if (currentPaused !== lastSsePaused) {
+      lastSsePaused = currentPaused;
+      sseBroadcast('pause', { paused: currentPaused, timestamp: new Date().toISOString() });
+    }
+
+    sseBroadcast('heartbeat', { timestamp: new Date().toISOString() });
+  } catch (err) {
+    log.error({ msg: 'SSE polling error', err: String(err) });
+  }
+}
+
+/** Starts the shared poll + agent subscription on the first connected client. */
+function startSseHubIfNeeded(agent: PayFiAgent | undefined): void {
+  if (agent) sseHubAgent = agent;
+
+  if (sseHubAgent && !sseTaskListener) {
+    sseTaskListener = (result) => {
+      sseBroadcast('task_result', { result, timestamp: new Date().toISOString() });
+    };
+    sseHubAgent.on('task:complete', sseTaskListener);
+    sseHubAgent.on('task:failed', sseTaskListener);
+  }
+
+  if (sseHubTimer) return;
+  lastSseSpendingTotal = spendingTracker.total();
+  lastSseApprovals = sseHubAgent?.listApprovals() ?? [];
+  lastSseApprovalIds = new Set(lastSseApprovals.map((a) => a.id));
+  lastSsePaused = isPaused();
+  sseHubTimer = setInterval(pollSseHub, SSE_POLL_INTERVAL_MS);
+}
+
+/** Stops the shared poll + agent subscription once the last client disconnects. */
+function stopSseHubIfIdle(): void {
+  if (sseClients.size > 0) return;
+  if (sseHubTimer) {
+    clearInterval(sseHubTimer);
+    sseHubTimer = undefined;
+  }
+  if (sseHubAgent && sseTaskListener) {
+    sseHubAgent.off('task:complete', sseTaskListener);
+    sseHubAgent.off('task:failed', sseTaskListener);
+    sseTaskListener = undefined;
+  }
+}
+
 /**
  * GET /stream — SSE stream for real-time dashboard updates.
- * Emits events for: task results, spending changes, approval status, and agent pause/resume.
+ * Emits: task results, spending changes, approval status, and agent pause/resume,
+ * via the single shared hub above rather than a per-connection poll.
  */
 function handleStream(
   req: http.IncomingMessage,
   res: http.ServerResponse,
   agent: PayFiAgent | undefined
 ): void {
-  // SSE headers
+  if (sseClients.size >= MAX_SSE_CLIENTS) {
+    res.writeHead(503, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: 'Too many stream connections' }));
+    return;
+  }
+
   res.writeHead(200, {
     'Content-Type': 'text/event-stream',
     'Cache-Control': 'no-cache',
     Connection: 'keep-alive',
-    'Access-Control-Allow-Origin': '*',
   });
 
-  // Helper to send SSE events
-  const sendEvent = (event: string, data: unknown): void => {
-    res.write(`event: ${event}\n`);
-    res.write(`data: ${JSON.stringify(data)}\n\n`);
-  };
+  const client: SseClient = { res, nextEventId: 1 };
+  sseClients.add(client);
+  startSseHubIfNeeded(agent);
 
-  // Send initial state
   try {
-    const spendingStatus = spendingTracker.getWindowStatus();
-    const approvals = agent?.listApprovals() ?? [];
-    const paused = isPaused();
-
-    sendEvent('initial', {
-      spending: {
-        ...spendingStatus,
-        limit: parseFloat(config.AGENT_SPENDING_LIMIT),
-        percentUsed:
-          spendingStatus.total > 0
-            ? (spendingStatus.total / parseFloat(config.AGENT_SPENDING_LIMIT)) * 100
-            : 0,
-      },
-      approvals,
-      paused,
+    sseSend(client, 'initial', {
+      spending: spendingSnapshot(),
+      approvals: lastSseApprovals,
+      paused: lastSsePaused,
       timestamp: new Date().toISOString(),
     });
   } catch (err) {
     log.error({ msg: 'Failed to send initial SSE state', err: String(err) });
   }
 
-  // Set up polling for updates (simple approach without event emitter changes)
-  const POLL_INTERVAL_MS = 2000;
-  let lastSpendingTotal = spendingTracker.total();
-  let lastApprovalCount = agent?.listApprovals().length ?? 0;
-  let lastPausedState = isPaused();
-
-  const interval = setInterval(() => {
-    try {
-      // Check for spending changes
-      const currentSpendingTotal = spendingTracker.total();
-      if (currentSpendingTotal !== lastSpendingTotal) {
-        lastSpendingTotal = currentSpendingTotal;
-        const spendingStatus = spendingTracker.getWindowStatus();
-        sendEvent('spending', {
-          ...spendingStatus,
-          limit: parseFloat(config.AGENT_SPENDING_LIMIT),
-          percentUsed:
-            spendingStatus.total > 0
-              ? (spendingStatus.total / parseFloat(config.AGENT_SPENDING_LIMIT)) * 100
-              : 0,
-          timestamp: new Date().toISOString(),
-        });
-      }
-
-      // Check for approval changes
-      if (agent) {
-        const currentApprovals = agent.listApprovals();
-        if (currentApprovals.length !== lastApprovalCount) {
-          lastApprovalCount = currentApprovals.length;
-          sendEvent('approvals', {
-            approvals: currentApprovals,
-            timestamp: new Date().toISOString(),
-          });
-        }
-      }
-
-      // Check for pause/resume changes
-      const currentPaused = isPaused();
-      if (currentPaused !== lastPausedState) {
-        lastPausedState = currentPaused;
-        sendEvent('pause', {
-          paused: currentPaused,
-          timestamp: new Date().toISOString(),
-        });
-      }
-
-      // Send periodic heartbeat
-      sendEvent('heartbeat', { timestamp: new Date().toISOString() });
-    } catch (err) {
-      log.error({ msg: 'SSE polling error', err: String(err) });
-    }
-  }, POLL_INTERVAL_MS);
-
-  // Clean up on client disconnect
   req.on('close', () => {
-    clearInterval(interval);
+    sseClients.delete(client);
+    stopSseHubIfIdle();
     log.info('SSE client disconnected');
   });
 }
