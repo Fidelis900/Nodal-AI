@@ -15,7 +15,7 @@ import {
 } from '@stellar/stellar-sdk';
 import { z } from 'zod';
 import { config, MAINNET_SPENDING_CAP } from '../config';
-import { createAgentSigner, Signer } from '../signer';
+import { createAgentSigner, signSorobanAuthEntries, Signer } from '../signer';
 import { logger } from '../utils/logger';
 import {
   loadAccount,
@@ -337,6 +337,8 @@ export class SorobanInvokeTool {
     // verifies the same object that will be submitted. If the transaction is ever
     // rebuilt (e.g., after a fee bump), this alias must be updated accordingly.
     const signedTx = preparedTx;
+    const { sequence } = await sorobanServer.getLatestLedger();
+    await signSorobanAuthEntries(signedTx, this.signer, sequence + 100);
     this.signer.signTransaction(signedTx);
 
     // Guard: ensure at least one signature was attached. A no-op sign() call
@@ -377,7 +379,7 @@ export class SorobanInvokeTool {
     events: readonly xdr.DiagnosticEvent[],
     record: boolean
   ): void {
-    const totalRaw = extractSacTransferTotal(events, this.signer.publicKey());
+    const totalRaw = extractSacTransferTotal(events, this.signer.policyAccount ?? this.signer.publicKey());
     if (totalRaw <= 0n) return;
 
     const amountStr = sacRawToDecimal(totalRaw);

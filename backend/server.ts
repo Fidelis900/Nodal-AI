@@ -38,6 +38,7 @@ import { metricsRegistry, renderMetrics, spendingWindowTotal } from './metrics';
 import { pauseAgent, resumeAgent, isPaused } from './kill_switch';
 import { assetKey as makeAssetKey } from './spending_tracker';
 import { stroopsToString } from './utils/amount';
+import { getOnChainPolicy } from './policy_account';
 
 const log = createLogger('health-server');
 
@@ -268,19 +269,27 @@ export function createHealthServer(agent?: PayFiAgent): http.Server {
 
       const total = spendingTracker.total();
       const limit = parseFloat(config.AGENT_SPENDING_LIMIT);
-      const body = JSON.stringify({
-        total,
-        limit,
-        windowMs: config.SPENDING_WINDOW_MS,
-        percentUsed: (total / limit) * 100,
-        usage: buildSpendingUsage(),
-      });
-
-      res.writeHead(200, {
-        'Content-Type': 'application/json',
-        'Content-Length': Buffer.byteLength(body),
-      });
-      res.end(body);
+      void getOnChainPolicy()
+        .then((onChain) => {
+          const body = JSON.stringify({
+            total,
+            limit,
+            windowMs: config.SPENDING_WINDOW_MS,
+            percentUsed: (total / limit) * 100,
+            usage: buildSpendingUsage(),
+            onChain: onChain
+              ? { spent: onChain.spent, limit: onChain.limit, window: onChain.window, windowStart: onChain.windowStart }
+              : null,
+          });
+          res.writeHead(200, { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) });
+          res.end(body);
+        })
+        .catch((err) => {
+          log.warn({ error: String(err) }, 'Could not read on-chain policy for spending endpoint');
+          const body = JSON.stringify({ total, limit, windowMs: config.SPENDING_WINDOW_MS, percentUsed: (total / limit) * 100, usage: buildSpendingUsage(), onChain: null });
+          res.writeHead(200, { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) });
+          res.end(body);
+        });
       return;
     }
 

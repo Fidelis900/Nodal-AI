@@ -10,6 +10,7 @@ import { db } from './db/client';
 import { createLogger } from './utils/logger';
 import { initTelemetry, shutdownTelemetry } from './telemetry';
 import { configPromise } from './config';
+import { validateOnChainPolicy } from './policy_account';
 
 const log = createLogger('process');
 
