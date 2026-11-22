@@ -1,53 +1,27 @@
-# Dependencies
-node_modules/
-
-# Build output
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+*.egg
 dist/
-
-# Test coverage & snapshots
-coverage/
-tests/__snapshots__/
-
-# Rust / Cargo
-**/target/
-**/Cargo.lock
-
-# Soroban test snapshots
-contracts/escrow/test_snapshots/
-
-# Environment secrets — never commit real .env files
+build/
+.eggs/
+venv/
 .env
-.env.*
-!.env.example
+*.pyc
 
-# Cryptographic key files
-*.key
-*.pem
-*.p12
+# Node
+node_modules/
+dist/
+npm-debug.log*
+.yarn-integrity
 
-# OS / editor artefacts
+# OS
 .DS_Store
 Thumbs.db
-.vscode/
-.idea/
-*.swp
-*.swo
-*~
 
-# Logs
-*.log
-logs/
-npm-debug.log*
-yarn-debug.log*
-yarn-error.log*
-
-# TypeScript incremental build info
-*.tsbuildinfo
-
-# Vitest / Jest cache
-.vitest-cache/
-.jest-cache/
-
-# Temporary files
-tmp/
-temp/
+# Stryker
+.stryker-tmp/
+.coverage
+coverage/

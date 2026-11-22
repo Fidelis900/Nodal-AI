@@ -14,10 +14,45 @@ module.exports = {
 
   overrides: [
     {
-      files: [
-        "backend/agent.ts",
-        "backend/tools/**/*.ts",
+      // Enforce structured logger usage across all backend source files.
+      // console.* calls are forbidden here; use createLogger() from
+      // backend/utils/logger.ts instead.
+      files: ["backend/**/*.ts"],
+      excludedFiles: [
+        // backend/logger.ts is the deprecated shim — it must be allowed to
+        // re-export from utils/logger for backward compatibility.
+        "backend/logger.ts",
       ],
+      rules: {
+        "no-console": "error",
+        // pino's signature is (mergingObject, message). A string-first call
+        // with a fields object silently drops the fields, so forbid it.
+        "no-restricted-syntax": [
+          "error",
+          {
+            selector:
+              "CallExpression[callee.type='MemberExpression'][callee.property.name=/^(trace|debug|info|warn|error|fatal)$/][callee.object.name=/^(logger|log|[a-z]+Log)$/][arguments.length>1][arguments.0.type=/^(Literal|TemplateLiteral)$/]",
+            message:
+              "pino expects logger.<level>({ ...fields }, 'message'). Put the fields object first and the message string second.",
+          },
+        ],
+        // Block imports from the deprecated ./logger shim. Use ./utils/logger instead.
+        "no-restricted-imports": [
+          "error",
+          {
+            patterns: [
+              {
+                group: ["./logger", "../logger", "../../logger"],
+                message: "Import from './utils/logger' instead. The './logger' shim is deprecated.",
+              },
+            ],
+          },
+        ],
+      },
+    },
+    {
+      files: ["backend/**/*.ts"],
+      excludedFiles: ["backend/config.ts"],
 
       // Environment variables must be accessed through backend/config.ts
       // so they pass Zod validation and secret-redaction logic.

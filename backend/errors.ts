@@ -7,15 +7,34 @@
  */
 
 export enum ErrorType {
-  InsufficientFunds = "INSUFFICIENT_FUNDS",
-  NetworkTimeout = "NETWORK_TIMEOUT",
-  ValidationError = "VALIDATION_ERROR",
-  RateLimitError = "RATE_LIMIT_ERROR",
-  UnauthorizedError = "UNAUTHORIZED_ERROR",
-  ContractError = "CONTRACT_ERROR",
-  TransactionFailure = "TRANSACTION_FAILURE",
-  ConfigError = "CONFIG_ERROR",
-  UnknownError = "UNKNOWN_ERROR",
+  InsufficientFunds = 'INSUFFICIENT_FUNDS',
+  NetworkTimeout = 'NETWORK_TIMEOUT',
+  ValidationError = 'VALIDATION_ERROR',
+  RateLimitError = 'RATE_LIMIT_ERROR',
+  UnauthorizedError = 'UNAUTHORIZED_ERROR',
+  ContractError = 'CONTRACT_ERROR',
+  /**
+   * A simulation exceeded its resource budget (Issue #569).
+   *
+   * Separate from ContractError because the caller's response differs: a
+   * budget overrun is retryable with a larger budget or a smaller call, while
+   * a contract error usually is not. Sharing one type forced callers to
+   * string-match the message, which is exactly what errorType exists to avoid.
+   */
+  SimulationBudgetExceeded = 'SIMULATION_BUDGET_EXCEEDED',
+  TransactionFailure = 'TRANSACTION_FAILURE',
+  ConfigError = 'CONFIG_ERROR',
+  /** The operator kill switch is engaged; value-moving tasks are halted. */
+  AgentPaused = 'AGENT_PAUSED',
+  /** The task exceeds APPROVAL_THRESHOLD and is waiting for a human decision. */
+  PendingApproval = 'PENDING_APPROVAL',
+  /** The payment destination is not permitted by PAYMENT_DESTINATION_POLICY. */
+  PolicyViolation = 'POLICY_VIOLATION',
+  /** An idempotency key was reused with a different payload. */
+  IdempotencyConflict = 'IDEMPOTENCY_CONFLICT',
+  /** The agent is draining for shutdown; the task was never executed. */
+  AgentShuttingDown = 'AGENT_SHUTTING_DOWN',
+  UnknownError = 'UNKNOWN_ERROR',
 }
 
 export class StructuredError extends Error {
@@ -45,6 +64,18 @@ export class NetworkTimeoutError extends StructuredError {
   }
 }
 
+/**
+ * Soroban RPC could not be reached, so an operation that needs live ledger
+ * data was not attempted (e.g. an x402 auth entry was not signed, #923).
+ * Retryable: release any reservation and try again.
+ */
+export class RpcUnavailableError extends NetworkTimeoutError {
+  constructor(message: string, cause?: unknown) {
+    super(message, cause);
+    Object.setPrototypeOf(this, RpcUnavailableError.prototype);
+  }
+}
+
 export class ValidationError extends StructuredError {
   constructor(message: string, cause?: unknown) {
     super(message, ErrorType.ValidationError, cause);
@@ -53,7 +84,7 @@ export class ValidationError extends StructuredError {
 }
 
 export class RateLimitError extends StructuredError {
-  readonly retryAfterSeconds?: number;
+  public readonly retryAfterSeconds?: number;
 
   constructor(message: string, retryAfterSeconds?: number, cause?: unknown) {
     super(message, ErrorType.RateLimitError, cause);
@@ -70,7 +101,7 @@ export class UnauthorizedError extends StructuredError {
 }
 
 export class ContractError extends StructuredError {
-  readonly contractId?: string;
+  public readonly contractId?: string;
 
   constructor(message: string, contractId?: string, cause?: unknown) {
     super(message, ErrorType.ContractError, cause);
@@ -80,7 +111,7 @@ export class ContractError extends StructuredError {
 }
 
 export class TransactionFailureError extends StructuredError {
-  readonly txHash?: string;
+  public readonly txHash?: string;
 
   constructor(message: string, txHash?: string, cause?: unknown) {
     super(message, ErrorType.TransactionFailure, cause);
@@ -96,6 +127,74 @@ export class ConfigError extends StructuredError {
   }
 }
 
+export class SimulationBudgetError extends StructuredError {
+  constructor(message: string, cause?: unknown) {
+    super(message, ErrorType.SimulationBudgetExceeded, cause);
+    Object.setPrototypeOf(this, SimulationBudgetError.prototype);
+  }
+}
+
+export class AgentPausedError extends StructuredError {
+  constructor(message: string, cause?: unknown) {
+    super(message, ErrorType.AgentPaused, cause);
+    Object.setPrototypeOf(this, AgentPausedError.prototype);
+  }
+}
+
+export class AgentShuttingDownError extends StructuredError {
+  constructor(message = 'Agent is shutting down — task rejected', cause?: unknown) {
+    super(message, ErrorType.AgentShuttingDown, cause);
+    Object.setPrototypeOf(this, AgentShuttingDownError.prototype);
+  }
+}
+
+export class PolicyViolationError extends StructuredError {
+  constructor(message: string, cause?: unknown) {
+    super(message, ErrorType.PolicyViolation, cause);
+    Object.setPrototypeOf(this, PolicyViolationError.prototype);
+  }
+}
+
+// ─── Destination pre-flight errors (#788) ────────────────────────────────────
+// Raised before signing, so the payment never reaches the network. All three
+// are ValidationErrors (the request cannot succeed as given) with their own
+// class so callers can tell which check failed without string-matching.
+
+/** The destination account does not exist on the network. */
+export class DestinationNotFoundError extends ValidationError {
+  readonly destination: string;
+
+  constructor(message: string, destination: string, cause?: unknown) {
+    super(message, cause);
+    this.destination = destination;
+    Object.setPrototypeOf(this, DestinationNotFoundError.prototype);
+  }
+}
+
+/** The destination has no trustline for the non-native asset being sent. */
+export class MissingTrustlineError extends ValidationError {
+  readonly destination: string;
+  readonly asset: string;
+
+  constructor(message: string, destination: string, asset: string, cause?: unknown) {
+    super(message, cause);
+    this.destination = destination;
+    this.asset = asset;
+    Object.setPrototypeOf(this, MissingTrustlineError.prototype);
+  }
+}
+
+/** The destination requires a memo (SEP-29 `config.memo_required`) and none was given. */
+export class MemoRequiredError extends ValidationError {
+  readonly destination: string;
+
+  constructor(message: string, destination: string, cause?: unknown) {
+    super(message, cause);
+    this.destination = destination;
+    Object.setPrototypeOf(this, MemoRequiredError.prototype);
+  }
+}
+
 function getErrorType(error: unknown): ErrorType {
   if (error instanceof StructuredError) {
     return error.errorType;
@@ -104,3 +203,25 @@ function getErrorType(error: unknown): ErrorType {
 }
 
 export { getErrorType };
+
+const SENSITIVE_CAUSE_KEYS = new Set(['secretKey', 'privateKey', 'seed', '_secretKey']);
+
+/**
+ * Recursively strips keys that may carry Stellar signing material (secretKey,
+ * privateKey, seed, _secretKey) from an error cause before it is attached to
+ * a thrown error, so it can't be exfiltrated via JSON-serialised logs/webhooks.
+ */
+export function sanitizeCause(cause: unknown): unknown {
+  if (Array.isArray(cause)) {
+    return cause.map(sanitizeCause);
+  }
+  if (cause !== null && typeof cause === 'object') {
+    const sanitized: Record<string, unknown> = {};
+    for (const [key, value] of Object.entries(cause)) {
+      if (SENSITIVE_CAUSE_KEYS.has(key)) continue;
+      sanitized[key] = sanitizeCause(value);
+    }
+    return sanitized;
+  }
+  return cause;
+}

@@ -5,8 +5,8 @@
  *
  * Config usage pattern:
  *   - All network/identity values come from the validated `config` singleton.
- *   - Tools that need the Keypair call `config.agentKeypair()` explicitly —
- *     the secret never lives on the config object itself.
+ *   - Tools sign through the agent-owned `Signer` (backend/signer.ts) and never
+ *     receive the secret key; the secret never lives on the config object itself.
  *   - The spending limit is enforced here before delegating to tools.
  */
 
@@ -39,6 +39,96 @@ import { approvalStore } from "./approval_store";
 
 // Instantiate a singleton tracker
 export const spendingTracker = new SpendingTracker();
+import { EventEmitter } from 'events';
+import { createHash, randomUUID } from 'crypto';
+import { rpc } from '@stellar/stellar-sdk';
+import { config, MAINNET_SPENDING_CAP } from './config';
+import { logger } from './utils/logger';
+import {
+  saveResult,
+  appendAuditEntry,
+  type AuditEntry,
+  savePendingApproval,
+  getPendingApproval,
+  listPendingApprovals,
+  decideApproval,
+  expirePendingApprovals,
+  getIdempotencyResult,
+  saveIdempotencyResult,
+  pruneIdempotencyKeys,
+  PendingApproval,
+} from './persistence';
+import {
+  AgentPausedError,
+  AgentShuttingDownError,
+  ErrorType,
+  PolicyViolationError,
+  StructuredError,
+  getErrorType,
+  sanitizeCause,
+} from './errors';
+import { StellarPaymentTool } from './tools/StellarPaymentTool';
+import { SorobanInvokeTool } from './tools/SorobanInvokeTool';
+import { X402PaymentTool, X402Challenge, X402ChallengeSchema } from './tools/X402PaymentTool';
+import { AccountInfoTool } from './tools/AccountInfoTool';
+import { TrustlineTool } from './tools/TrustlineTool';
+import { MultiSigPaymentTool } from './tools/MultiSigPaymentTool';
+import { BatchPaymentTool } from './tools/BatchPaymentTool';
+import { SorobanQueryTool } from './tools/SorobanQueryTool';
+import { BalanceCheckTool } from './tools/BalanceCheckTool';
+import { PathPaymentTool } from './tools/PathPaymentTool';
+import { FeeBumpTool } from './tools/FeeBumpTool';
+import { DexOfferTool } from './tools/DexOfferTool';
+import { LiquidityPoolTool } from './tools/LiquidityPoolTool';
+import { StellarTomlTool } from './tools/StellarTomlTool';
+import { DataEntryTool } from './tools/DataEntryTool';
+import { SequenceNumberTool } from './tools/SequenceNumberTool';
+import { SponsoredAccountTool } from './tools/SponsoredAccountTool';
+import { AnchorQuoteTool } from './tools/AnchorQuoteTool';
+import { SorobanDeployTool } from './tools/SorobanDeployTool';
+import { SwapTool } from './tools/SwapTool';
+import { AccountHistoryTool } from './tools/AccountHistoryTool';
+import { SetOptionsTool } from './tools/SetOptionsTool';
+import { SorobanEventIndexerTool } from './tools/SorobanEventIndexerTool';
+import { StellarIdentityTool } from './tools/StellarIdentityTool';
+import { FriendBotTool } from './tools/FriendBotTool';
+import { NanoPaymentTool } from './tools/NanoPaymentTool';
+import { listen as listenContractEvents } from './tools/ContractEventListener';
+import {
+  watchContractStorage,
+  ContractStorageWatcherOptions,
+  StorageChangeEvent,
+} from './tools/ContractStorageWatcherTool';
+import { X402FetchClient, type X402FetchResult } from './x402/client';
+import type { AgentTool, ToolContext } from './tools/AgentTool';
+import { createBuiltinTools } from './tools/builtin';
+import { queueDepth, recordTask } from './metrics';
+import { withSpan, markSpanError, setTxHashAttribute, SPAN_ATTR } from './telemetry';
+
+import { horizonServer } from './rpc_client';
+import * as rpcClient from './rpc_client';
+import { createLogger, generateCorrelationId } from './utils/logger';
+import { spendingTracker, assetKey } from './spending_tracker';
+import { toStroops, tryToStroops, stroopsToString, STROOPS_PER_UNIT } from './utils/amount';
+import { failureAlerts } from './alerts';
+import { dispatchWebhook } from './webhook';
+import { createAgentSigner, Signer } from './signer';
+import { isPaused } from './kill_switch';
+import { taskContext, type AgentEvents } from './events';
+
+// Re-exported so existing importers (`server.ts`, tests) keep working after the
+// singleton moved to spending_tracker.ts.
+export { spendingTracker };
+export type { AgentEvents };
+
+/**
+ * Reset the module-level SpendingTracker singleton.
+ * FOR TESTING ONLY — clears in-memory entries between tests.
+ * @internal
+ */
+export function _resetSpendingTrackerForTests(): void {
+  spendingTracker._resetForTests();
+}
 
 // ─── Approval threshold helper ────────────────────────────────────────────────
 
@@ -86,6 +176,93 @@ function requiresApproval(task: AgentTask): boolean {
 
 // ─── Spending limit guard ─────────────────────────────────────────────────────
 
+/** One amount a value-moving task would spend, and the asset it is spent in (#733). */
+interface TaskSpend {
+  amount: string;
+  assetKey: string;
+}
+
+/** Canonical asset key for a `{ code, issuer }` payload object (path payments, DEX offers). */
+function assetObjectKey(asset: unknown): string {
+  const a = (asset ?? {}) as Record<string, unknown>;
+  return assetKey(
+    typeof a.code === 'string' ? a.code : 'XLM',
+    typeof a.issuer === 'string' ? a.issuer : undefined
+  );
+}
+
+/** Canonical asset key for an `assetCode` / `assetIssuer` payload pair. */
+function assetFieldsKey(
+  code: unknown,
+  issuer: unknown,
+  defaultCode: string,
+  defaultIssuer?: string
+): string {
+  return assetKey(
+    typeof code === 'string' ? code : defaultCode,
+    typeof issuer === 'string' ? issuer : defaultIssuer
+  );
+}
+
+/**
+ * What a value-moving task would spend against the rolling-window limit,
+ * one entry per asset. Empty when the task moves no value (or, for a multisig
+ * payment, will not be submitted yet). Non-string amounts are skipped — the
+ * tool's own schema rejects them.
+ *
+ * Batch payments are summed per asset in BigInt stroops (#734): a float sum
+ * both drifts (0.1 + 0.2) and would charge every asset against one total.
+ */
+function taskSpends(task: AgentTask): TaskSpend[] {
+  const p = (task.payload ?? {}) as Record<string, unknown>;
+  const one = (amount: unknown, key: string): TaskSpend[] =>
+    typeof amount === 'string' ? [{ amount, assetKey: key }] : [];
+
+  switch (task.type) {
+    case 'stellar_payment':
+      return one(p.amount, assetFieldsKey(p.assetCode, p.assetIssuer, 'XLM'));
+
+    case 'x402_respond':
+      return one(
+        p.amount,
+        assetFieldsKey(p.assetCode, p.assetIssuer, config.X402_ASSET_CODE, config.X402_ASSET_ISSUER)
+      );
+
+    case 'multisig_payment': {
+      const sigs = Array.isArray(p.signatures) ? p.signatures : [];
+      const minSig = typeof p.minSignatures === 'number' ? p.minSignatures : 1;
+      if (sigs.length < minSig) return [];
+      return one(p.amount, assetFieldsKey(p.assetCode, p.assetIssuer, 'XLM'));
+    }
+
+    case 'batch_payment': {
+      const payments = Array.isArray(p.payments) ? p.payments : [];
+      const perAsset = new Map<string, bigint>();
+      for (const pay of payments) {
+        const q = (pay ?? {}) as Record<string, unknown>;
+        const stroops = typeof q.amount === 'string' ? tryToStroops(q.amount) : null;
+        if (stroops === null) continue;
+        const key = assetFieldsKey(q.assetCode, q.assetIssuer, 'XLM');
+        perAsset.set(key, (perAsset.get(key) ?? 0n) + stroops);
+      }
+      return [...perAsset].map(([key, stroops]) => ({
+        amount: stroopsToString(stroops),
+        assetKey: key,
+      }));
+    }
+
+    case 'path_payment':
+      return one(p.sendAmount, assetObjectKey(p.sendAsset));
+
+    case 'dex_offer':
+      // Only guard non-zero amounts (delete action sets amount to "0")
+      return p.amount && p.amount !== '0' ? one(p.amount, assetObjectKey(p.selling)) : [];
+
+    default:
+      return [];
+  }
+}
+
 /**
  * Check that a payment amount does not exceed the configured per-payment and
  * mainnet spending caps, then **reserve** the amount against the cumulative
@@ -99,56 +276,154 @@ function requiresApproval(task: AgentTask): boolean {
  * bad-sequence retry, or any other submission failure does NOT permanently
  * consume quota from the rolling window.
  *
- * Returns `null` for non-string amounts (tool schema will catch them).
- *
- * @throws if the single-payment amount exceeds AGENT_SPENDING_LIMIT or the
- *   mainnet safety cap, or if the cumulative reserved+committed total would
- *   exceed the limit.
+ * @throws if the amount is malformed, the single-payment amount exceeds
+ *   AGENT_SPENDING_LIMIT or the mainnet safety cap, or if the cumulative
+ *   reserved+committed total would exceed the limit.
  */
-function reserveSpendingLimit(amount: unknown): string | null {
-  if (typeof amount !== "string") return null; // let the tool's own schema catch this
+function reserveSpendingLimit(spend: TaskSpend): string {
+  const stroops = toStroops(spend.amount);
 
-  const parsed = parseFloat(amount);
-  const limit = parseFloat(config.AGENT_SPENDING_LIMIT);
-
-  // Layer 1: single-payment cap
-  if (!isNaN(parsed) && parsed > limit) {
+  // Layer 1: single-payment cap. With per-asset limits configured (#733) the
+  // tracker applies the asset's own limit instead.
+  if (config.SPENDING_LIMITS_MAP.size === 0 && stroops > toStroops(config.AGENT_SPENDING_LIMIT)) {
     throw new Error(
-      `Payment amount ${amount} ${config.X402_ASSET_CODE} exceeds ` +
+      `Payment amount ${spend.amount} ${spend.assetKey} exceeds ` +
         `AGENT_SPENDING_LIMIT of ${config.AGENT_SPENDING_LIMIT}`
     );
   }
   // Layer 2: mainnet hard cap
-  if (!isNaN(parsed) && config.STELLAR_NETWORK === "mainnet" && parsed > MAINNET_SPENDING_CAP) {
+  if (
+    config.STELLAR_NETWORK === 'mainnet' &&
+    stroops > BigInt(MAINNET_SPENDING_CAP) * STROOPS_PER_UNIT
+  ) {
     throw new Error(
-      `Payment amount ${amount} ${config.X402_ASSET_CODE} exceeds ` +
+      `Payment amount ${spend.amount} ${spend.assetKey} exceeds ` +
         `mainnet spending cap of ${MAINNET_SPENDING_CAP}`
     );
   }
 
   // Layer 3: reserve against rolling-window cumulative limit (issue #729)
   // Returns a reservationId — caller must commit() on success or release() on failure.
-  return spendingTracker.reserve(amount);
+  return spendingTracker.reserve(spend.amount, spend.assetKey);
 }
 
-const log = createLogger("orchestrator");
+/**
+ * Reserve every spend of `task`. All-or-nothing: if one reservation is
+ * refused, the ones already taken are released before the error propagates.
+ */
+function reserveTaskSpends(task: AgentTask): string[] {
+  const ids: string[] = [];
+  try {
+    for (const spend of taskSpends(task)) ids.push(reserveSpendingLimit(spend));
+  } catch (err) {
+    for (const id of ids) spendingTracker.release(id);
+    throw err;
+  }
+  return ids;
+}
+
+const log = createLogger('orchestrator');
+
+// ─── Payment destination policy (#735) ───────────────────────────────────────
+
+/**
+ * Every counterparty a task would pay: `destination`, the x402 `payTo`, and
+ * each batch payment's `destination`.
+ */
+function taskDestinations(task: AgentTask): string[] {
+  const p = (task.payload ?? {}) as Record<string, unknown>;
+  const destinations: unknown[] = [p.destination, p.payTo];
+  if (Array.isArray(p.payments)) {
+    for (const pay of p.payments) {
+      destinations.push((pay as Record<string, unknown>)?.destination);
+    }
+  }
+  return destinations.filter((d): d is string => typeof d === 'string' && d.length > 0);
+}
+
+/**
+ * Enforce PAYMENT_DESTINATION_POLICY for a value-moving task. Matching ignores
+ * case so federation names compare the way federation servers resolve them.
+ *
+ * @throws PolicyViolationError if any destination is not permitted.
+ */
+function assertDestinationsAllowed(task: AgentTask): void {
+  const policy = config.PAYMENT_DESTINATION_POLICY;
+  if (policy === 'open') return;
+
+  const listed = new Set(config.PAYMENT_DESTINATIONS.map((d) => d.toLowerCase()));
+  for (const destination of taskDestinations(task)) {
+    const isListed = listed.has(destination.toLowerCase());
+    if (policy === 'allowlist' ? !isListed : isListed) {
+      throw new PolicyViolationError(
+        `Destination ${destination} is not permitted by the ${policy} payment destination policy`
+      );
+    }
+  }
+}
+
+/**
+ * The amount a value-moving task would spend, as compared against
+ * APPROVAL_THRESHOLD (#736): `sendAmount` for path payments, the sum of every
+ * payment for batches, and `amount` otherwise. `null` when the task carries no
+ * amount.
+ */
+function taskAmount(task: AgentTask): string | null {
+  const p = (task.payload ?? {}) as Record<string, unknown>;
+  if (task.type === 'batch_payment' && Array.isArray(p.payments)) {
+    const total = p.payments.reduce((sum: number, pay: unknown) => {
+      const amt = parseFloat((pay as Record<string, unknown>)?.amount as string);
+      return sum + (isNaN(amt) ? 0 : amt);
+    }, 0);
+    return String(total);
+  }
+  const amount = task.type === 'path_payment' ? p.sendAmount : p.amount;
+  return typeof amount === 'string' ? amount : null;
+}
 
 // ─── Task types ───────────────────────────────────────────────────────────────
 
-export type TaskType =
-  | "stellar_payment"
-  | "soroban_invoke"
-  | "soroban_query"
-  | "x402_respond"
-  | "account_info"
-  | "change_trust"
-  | "multisig_payment"
-  | "batch_payment"
-  | "balance_check"
-  | "path_payment"
-  | "fee_bump"
-  | "dex_offer";
+/** Task types handled by the tools PayFiAgent registers at construction. */
+export type BuiltinTaskType =
+  | 'stellar_payment'
+  | 'soroban_invoke'
+  | 'soroban_query'
+  | 'x402_respond'
+  | 'account_info'
+  | 'change_trust'
+  | 'multisig_payment'
+  | 'batch_payment'
+  | 'balance_check'
+  | 'path_payment'
+  | 'fee_bump'
+  | 'dex_offer'
+  | 'liquidity_pool'
+  | 'stellar_toml'
+  | 'data_entry'
+  | 'sequence_number'
+  | 'sponsored_account'
+  | 'anchor_quote'
+  | 'soroban_deploy'
+  | 'swap'
+  | 'account_history'
+  | 'set_options'
+  | 'soroban_event_query'
+  | 'stellar_identity_auth'
+  | 'cross_border_payment'
+  | 'friendbot'
+  | 'nano_payment'
+  | 'ledger_info'
+  | 'network_status'
+  | 'offer_book'
+  | 'soroban_storage';
 
+/**
+ * Any task type `run()` accepts: a built-in one, or the name of a tool added
+ * with {@link PayFiAgent.registerTool}. Intersecting `string` with an empty
+ * record keeps editor completion for the built-in names while allowing
+ * third-party ones.
+ */
+export type TaskType = BuiltinTaskType | (string & Record<never, never>);
 
 export interface AgentTask {
   type: TaskType;
@@ -158,7 +433,162 @@ export interface AgentTask {
    * one so every task execution is traceable end-to-end.
    */
   correlationId?: string;
+  /**
+   * Optional idempotency key for preventing duplicate executions.
+   * If a task with the same idempotencyKey and payload hash has already been
+   * executed, the stored result is returned without re-execution.
+   * Keys expire after 24 hours.
+   */
+  idempotencyKey?: string;
+  /**
+   * Hold this value-moving task for human approval regardless of
+   * APPROVAL_THRESHOLD (used by the MCP server's `approve` payment mode, #917).
+   */
+  requireApproval?: boolean;
 }
+
+/**
+ * An ordered list of tasks awaiting execution, with a human-readable summary
+ * to confirm before anything runs (see `planner.ts` / `executor.ts`).
+ */
+export interface Plan {
+  id: string;
+  tasks: AgentTask[];
+  /** Summary shown to the user before execution. */
+  summary: string;
+  /** ISO-8601 creation time. */
+  createdAt: string;
+  /** ISO-8601 time after which the plan may no longer be executed. */
+  expiresAt: string;
+}
+
+// ─── Type-safe payloads and results (#type-safe-tasks) ────────────────────────
+
+/**
+ * Payload types for each task type. Use with `AgentTask` for full type inference.
+ */
+export type TaskPayloadMap = {
+  stellar_payment: {
+    destination: string;
+    amount: string;
+    assetCode?: string;
+    assetIssuer?: string;
+    memo?: string;
+  };
+  soroban_invoke: { contractId: string; method: string; args?: unknown[] };
+  x402_respond: { challenge: unknown };
+  account_info: { accountId?: string };
+  change_trust: { assetCode: string; assetIssuer: string; limit?: string };
+  multisig_payment: {
+    destination: string;
+    amount: string;
+    signatures: string[];
+    minSignatures?: number;
+  };
+  batch_payment: { payments: Array<{ destination: string; amount: string }> };
+  balance_check: { accountId: string; assetCode?: string; assetIssuer?: string };
+  path_payment: {
+    destination: string;
+    sendAsset: string;
+    sendAmount: string;
+    destAsset: string;
+    destAmount?: string;
+  };
+  fee_bump: { innerTransactionXdr: string; feeAccount: string; baseFeeMultiplier?: number };
+  dex_offer: {
+    selling: string;
+    buying: string;
+    amount: string;
+    price: number;
+    action: 'create' | 'update' | 'delete';
+  };
+  liquidity_pool: {
+    liquidityProviderAccount: string;
+    reserveA: string;
+    reserveB: string;
+    amountA: string;
+    amountB: string;
+  };
+  stellar_toml: { domain: string };
+  data_entry: { key: string; value: string; contractId?: string };
+  sequence_number: { accountId: string };
+  sponsored_account: { sponsoredAccountId: string; sponsorSigner: string };
+  anchor_quote: { sourceAsset: string; destAsset: string; amount: string };
+  soroban_deploy: { wasmHash: string; salt?: string };
+  swap: { sourceAsset: string; destAsset: string; amount: string };
+  account_history: { accountId: string; limit?: number };
+  set_options: {
+    accountId: string;
+    thresholds?: { lowThreshold?: number; medThreshold?: number; highThreshold?: number };
+    homeDomain?: string;
+  };
+  soroban_event_query: { contractId: string; startLedger?: number; eventTypes?: string[] };
+  stellar_identity_auth: { accountId: string; callback?: string };
+  friendbot: { accountId: string };
+  nano_payment: {
+    recipient: string;
+    amountRaw: string;
+    senderAccount?: string;
+    senderSeed?: string;
+    rpcUrl?: string;
+    skipPrecheck?: boolean;
+  };
+  soroban_query: { contractId: string; key: string };
+  network_status: Record<string, never>;
+  ledger_info: Record<string, never>;
+  offer_book: { base: string; counter: string; limit?: number };
+  soroban_storage: { contractId: string; key: string };
+  transaction_build: { operations: unknown[]; fee?: string };
+};
+
+/**
+ * Result data types for each task type. Use with `AgentResult` for full type inference.
+ */
+export type TaskResultMap = {
+  stellar_payment: { txHash: string; ledger: number; network: string };
+  soroban_invoke: { simulationResult: unknown };
+  x402_respond: { txHash: string; nonce: string; payer: string; signedAt: string };
+  account_info: unknown;
+  change_trust: { txHash: string; ledger: number };
+  multisig_payment: { txHash: string; ledger: number };
+  batch_payment: { txHashes: string[]; ledger: number };
+  balance_check: { balances: Record<string, string> };
+  path_payment: {
+    txHash: string;
+    ledger: number;
+    sourceBalanceDelta?: string;
+    destBalanceDelta?: string;
+  };
+  fee_bump: { txHash: string; ledger: number };
+  dex_offer: { offerId: string; txHash: string };
+  liquidity_pool: { liquidityPoolId: string; txHash: string };
+  stellar_toml: { fields: Record<string, string> };
+  data_entry: { key: string; value: string; contractId?: string };
+  sequence_number: { sequenceNumber: string };
+  sponsored_account: { txHash: string; sponsoredAccountId: string };
+  anchor_quote: { sourceAmount: string; destAmount: string; price: string };
+  soroban_deploy: { contractId: string; txHash: string };
+  swap: { txHash: string; sourceAmount: string; destAmount: string };
+  account_history: { operations: unknown[] };
+  set_options: { txHash: string; ledger: number };
+  soroban_event_query: { events: unknown[] };
+  stellar_identity_auth: { token: string };
+  friendbot: { txHash: string; accountId: string };
+  nano_payment: {
+    blockHash: string;
+    recipient: string;
+    amountRaw: string;
+    network: 'nano';
+    precheckPassed: boolean;
+    timestamp: string;
+  };
+  soroban_query: { value: unknown };
+  network_status: { buildNumber: string; currentProtocolVersion: number; currentLedger: number };
+  ledger_info: { sequence: number; totalCoins: string; baseFee: number };
+  offer_book: { bids: unknown[]; asks: unknown[] };
+  soroban_storage: { value: unknown };
+  transaction_build: { envelopeXdr: string };
+};
 
 export interface AgentResultData {
   txHash?: string;
@@ -198,18 +628,104 @@ export interface AgentResult {
    * Set to true when the task was held for human approval rather than executed.
    */
   pendingApproval?: boolean;
+  /** Wall-clock time in milliseconds spent executing the task (from dispatch to completion/failure). */
+  durationMs?: number;
+  /**
+   * Zero-based position of the task within the {@link PayFiAgent.runSequence}
+   * call that produced this result. Because `runSequence` stops at the first
+   * failure, the last entry's `sequenceIndex` is the index of the task that
+   * failed — callers no longer have to infer it from array position, which
+   * breaks as soon as results are filtered, sorted, or merged.
+   *
+   * Absent on results from {@link PayFiAgent.run}, which has no sequence.
+   */
+  sequenceIndex?: number;
 }
+
+/**
+ * Tasks that sign and submit a transaction from the agent account. These are
+ * halted while the kill switch is engaged; every other task is read-only and
+ * keeps working.
+ */
+export const VALUE_MOVING_TASK_TYPES: ReadonlySet<TaskType> = new Set<TaskType>([
+  'stellar_payment',
+  'soroban_invoke',
+  'x402_respond',
+  'change_trust',
+  'multisig_payment',
+  'batch_payment',
+  'path_payment',
+  'fee_bump',
+  'dex_offer',
+  'liquidity_pool',
+  'data_entry',
+  'sequence_number',
+  'sponsored_account',
+  'soroban_deploy',
+  'swap',
+  'set_options',
+  'cross_border_payment',
+]);
+
+// ─── Middleware types ─────────────────────────────────────────────────────────────
+
+/**
+ * Task middleware function type.
+ *
+ * Middleware functions are executed in registration order before the task
+ * is dispatched to the appropriate tool. Each middleware receives the task
+ * and a `next` function to continue execution. Calling `next()` passes control
+ * to the next middleware or the actual task execution. If a middleware returns
+ * a result without calling `next()`, it short-circuits execution.
+ *
+ * @param task - The task to be executed
+ * @param next - Function to call the next middleware or the actual task
+ * @returns The result of task execution or middleware short-circuit
+ */
+export type TaskMiddleware = (
+  task: AgentTask,
+  next: () => Promise<AgentResult>
+) => Promise<AgentResult>;
 
 // ─── Payload sanitisation ─────────────────────────────────────────────────────
 
-const SECRET_KEY_RE = /^(?<prefix>.*?["':\s]?)(?<secret>S[ A-Z2-7]{55})(?<suffix>["'\s]?.*)$/i;
+const SECRET_KEY_RE = /S[A-Z2-7]{55}/g;
 
 function redactSecretString(value: string): string {
-  return value.replace(SECRET_KEY_RE, "$<prefix>[REDACTED]$<suffix>");
+  return value.replace(SECRET_KEY_RE, '[REDACTED]');
+}
+
+/**
+ * Render an error as the string that goes into {@link AgentResult.error}.
+ *
+ * A {@link StructuredError} may carry a `cause` holding the context needed to
+ * act on the failure automatically — for an auth rejection, which signer was
+ * presented and which one was expected. That context is JSON-serialised onto
+ * the end of the message so it survives into persisted results and webhook
+ * payloads, both of which only carry the string.
+ *
+ * The cause is passed through `sanitizeCause` first, so signing material can
+ * never be serialised out this way, and the whole string is redacted by the
+ * caller afterwards as a second line of defence.
+ */
+function describeError(err: unknown): string {
+  const message = err instanceof Error ? err.message : String(err);
+  if (!(err instanceof StructuredError) || err.cause === undefined) {
+    return message;
+  }
+  try {
+    const context = JSON.stringify(sanitizeCause(err.cause));
+    // `undefined` and functions serialise to undefined rather than a string.
+    return context === undefined ? message : `${message} | context: ${context}`;
+  } catch {
+    // Circular or otherwise unserialisable cause: the message alone still has
+    // to get through, so a failure here must not lose the error entirely.
+    return message;
+  }
 }
 
 function sanitizePayload(payload: unknown): unknown {
-  if (payload === null || typeof payload !== "object") return payload;
+  if (payload === null || typeof payload !== 'object') return payload;
   if (Array.isArray(payload)) return payload.map(sanitizePayload);
 
   const sanitized: Record<string, unknown> = {};
@@ -221,13 +737,56 @@ function sanitizePayload(payload: unknown): unknown {
   return sanitized;
 }
 
+// ─── Audit log ────────────────────────────────────────────────────────────────
+
+function optionalString(value: unknown): string | null {
+  return typeof value === 'string' && value.length > 0 ? value : null;
+}
+
+/**
+ * Build the audit-log entry for a task that produced a signed transaction, or
+ * `null` when the result carries no `txHash` (read-only tasks, simulations,
+ * multisig envelopes still awaiting signatures). Friendbot transactions are
+ * signed by the Friendbot service, not the agent, so they are not recorded.
+ */
+function buildAuditEntry(
+  task: AgentTask,
+  data: unknown,
+  correlationId: string,
+  ts: string
+): AuditEntry | null {
+  if (task.type === 'friendbot' || data === null || typeof data !== 'object') return null;
+  const d = data as Record<string, unknown>;
+  const txHash = optionalString(d.txHash);
+  if (!txHash) return null;
+
+  const p = (task.payload ?? {}) as Record<string, unknown>;
+  const envelopeXdr = optionalString(d.envelopeXdr ?? d.envelope_xdr);
+  const assetCode = optionalString(p.assetCode);
+  const assetIssuer = optionalString(p.assetIssuer);
+
+  return {
+    ts,
+    correlationId,
+    taskType: task.type,
+    txHash,
+    envelopeHash: envelopeXdr ? createHash('sha256').update(envelopeXdr).digest('hex') : null,
+    destination: optionalString(p.destination ?? p.payTo),
+    asset: assetCode ? (assetIssuer ? `${assetCode}:${assetIssuer}` : assetCode) : null,
+    amount: optionalString(p.amount),
+  };
+}
+
 // ─── Agent ────────────────────────────────────────────────────────────────────
 
-export class PayFiAgent extends EventEmitter {
+export class PayFiAgent extends EventEmitter<AgentEvents> {
+  private readonly signer: Signer;
   private paymentTool: StellarPaymentTool;
   private sorobanTool: SorobanInvokeTool;
   private sorobanQueryTool: SorobanQueryTool;
   private x402Tool: X402PaymentTool;
+  /** x402 v2 fetch client — created lazily on first fetchPaid() call. */
+  private _x402FetchClient: X402FetchClient | null = null;
   private accountInfoTool: AccountInfoTool;
   private trustlineTool: TrustlineTool;
   private multiSigTool: MultiSigPaymentTool;
@@ -236,65 +795,117 @@ export class PayFiAgent extends EventEmitter {
   private pathPaymentTool: PathPaymentTool;
   private feeBumpTool: FeeBumpTool;
   private dexOfferTool: DexOfferTool;
+  private liquidityPoolTool: LiquidityPoolTool;
+  private stellarTomlTool: StellarTomlTool;
+  private dataEntryTool: DataEntryTool;
+  private sequenceNumberTool: SequenceNumberTool;
+  private sponsoredAccountTool: SponsoredAccountTool;
+  private anchorQuoteTool: AnchorQuoteTool;
+  private sorobanDeployTool: SorobanDeployTool;
+  private swapTool: SwapTool;
+  private accountHistoryTool: AccountHistoryTool;
+  private setOptionsTool: SetOptionsTool;
+  private sorobanEventIndexerTool: SorobanEventIndexerTool;
+  private stellarIdentityTool: StellarIdentityTool;
+  private friendBotTool: FriendBotTool;
+  private nanoPaymentTool: NanoPaymentTool;
 
   private activeTasks = 0;
   private isDraining = false;
+  private readonly taskQueue: Array<{
+    task: AgentTask;
+    correlationId: string;
+    resolve: (result: AgentResult) => void;
+  }> = [];
   private _streamStop: (() => void) | null = null;
   private _contractListenerStop: (() => void) | null = null;
+  private _storageWatcherStop: (() => void) | null = null;
 
   // Bound handler references kept so destroy() can call .off() with the exact same function
   // reference — EventEmitter requires identity equality for removal.
-  private readonly _boundHandlers = new Map<string, (...args: unknown[]) => void>();
+  private readonly _boundHandlers = new Map<keyof AgentEvents, (...args: unknown[]) => void>();
+
+  // Middleware array for pre/post task execution hooks
+  private middlewares: TaskMiddleware[] = [];
+
+  // Tasks re-dispatched by approve() — they skip the approval gate (#736).
+  private readonly approvedTasks = new WeakSet<AgentTask>();
+  // Spending reservations held by each pending approval, released on decision/expiry.
+  private readonly approvalReservations = new Map<string, string[]>();
+  // Tool registry (#746) — the catalog getTools() exposes, and the dispatch
+  // target for task types the switch in executeTask does not handle.
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  private readonly tools = new Map<TaskType, AgentTool<any, any>>();
 
   constructor() {
     super();
 
-    // config.agentKeypair().secret() is the canonical way to obtain the signing secret.
-    // Direct access to config.AGENT_SECRET_KEY is intentionally blocked by the AgentConfig
-    // type (Omit<RawEnv, "AGENT_SECRET_KEY">); using agentKeypair() makes the access explicit.
-    this.paymentTool = new StellarPaymentTool(config.agentKeypair().secret());
-    this.sorobanTool = new SorobanInvokeTool(config.agentKeypair().secret());
-    this.sorobanQueryTool = new SorobanQueryTool(config.agentKeypair().secret());
-    this.x402Tool    = new X402PaymentTool(config.agentKeypair().secret());
+    // Tools receive the agent-owned Signer, never the secret key itself, so the
+    // raw secret is not copied into every tool instance.
+    this.signer = createAgentSigner();
+    this.paymentTool = new StellarPaymentTool(this.signer);
+    this.sorobanTool = new SorobanInvokeTool(this.signer);
+    this.sorobanQueryTool = new SorobanQueryTool(this.signer);
+    this.x402Tool = new X402PaymentTool(this.signer);
     this.accountInfoTool = new AccountInfoTool();
-    this.trustlineTool = new TrustlineTool(config.agentKeypair().secret());
-    this.multiSigTool = new MultiSigPaymentTool(config.agentKeypair().secret());
-    this.batchPaymentTool = new BatchPaymentTool(config.agentKeypair().secret());
+    this.trustlineTool = new TrustlineTool(this.signer);
+    this.multiSigTool = new MultiSigPaymentTool(this.signer);
+    this.batchPaymentTool = new BatchPaymentTool(this.signer);
     this.balanceCheckTool = new BalanceCheckTool();
-    this.pathPaymentTool = new PathPaymentTool(config.agentKeypair().secret());
-    this.feeBumpTool = new FeeBumpTool(config.agentKeypair().secret());
-    this.dexOfferTool = new DexOfferTool(config.agentKeypair().secret());
+    this.pathPaymentTool = new PathPaymentTool(this.signer);
+    this.feeBumpTool = new FeeBumpTool(this.signer);
+    this.dexOfferTool = new DexOfferTool(this.signer);
+    this.liquidityPoolTool = new LiquidityPoolTool(this.signer);
+    this.stellarTomlTool = new StellarTomlTool();
+    this.dataEntryTool = new DataEntryTool(this.signer);
+    this.sequenceNumberTool = new SequenceNumberTool(this.signer);
+    this.sponsoredAccountTool = new SponsoredAccountTool(this.signer);
+    this.anchorQuoteTool = new AnchorQuoteTool();
+    this.sorobanDeployTool = new SorobanDeployTool();
+    this.swapTool = new SwapTool(this.signer);
+    this.accountHistoryTool = new AccountHistoryTool();
+    this.setOptionsTool = new SetOptionsTool(this.signer);
+    this.sorobanEventIndexerTool = new SorobanEventIndexerTool();
+    this.stellarIdentityTool = new StellarIdentityTool(this.signer);
+    this.friendBotTool = new FriendBotTool();
+    this.nanoPaymentTool = new NanoPaymentTool();
 
+    for (const tool of createBuiltinTools(this.signer)) {
+      this.registerTool(tool);
+    }
 
     // ── Register event listeners — every registration is mirrored in destroy() ──
     const onError = (err: Error) => {
-      const safe = err.message.replace(/S[A-Z2-7]{55}/g, "[REDACTED]");
-      logger.error("Unhandled agent error", { error: safe });
+      const safe = err.message.replace(/S[A-Z2-7]{55}/g, '[REDACTED]');
+      logger.error({ error: safe }, 'Unhandled agent error');
     };
     const onTaskComplete = (result: AgentResult) => {
-      logger.info("Task complete", { taskType: result.taskType });
+      logger.info({ taskType: result.taskType }, 'Task complete');
     };
     const onTaskFailed = (result: AgentResult) => {
-      logger.warn("Task failed", { taskType: result.taskType, error: result.error });
+      logger.warn({ taskType: result.taskType, error: result.error }, 'Task failed');
     };
 
-    this.on("error", onError);
-    this.on("task:complete", onTaskComplete);
-    this.on("task:failed", onTaskFailed);
+    this.on('error', onError);
+    this.on('task:complete', onTaskComplete);
+    this.on('task:failed', onTaskFailed);
 
-    this._boundHandlers.set("error", onError as (...args: unknown[]) => void);
-    this._boundHandlers.set("task:complete", onTaskComplete as (...args: unknown[]) => void);
-    this._boundHandlers.set("task:failed", onTaskFailed as (...args: unknown[]) => void);
+    this._boundHandlers.set('error', onError as (...args: unknown[]) => void);
+    this._boundHandlers.set('task:complete', onTaskComplete as (...args: unknown[]) => void);
+    this._boundHandlers.set('task:failed', onTaskFailed as (...args: unknown[]) => void);
 
     // Log only safe fields — public key is derived, not the secret
-    logger.info("PayFiAgent initialised", {
-      network: config.STELLAR_NETWORK,
-      horizon: config.HORIZON_URL,
-      soroban: config.SOROBAN_RPC_URL,
-      agentPubkey: config.AGENT_PUBLIC_KEY,
-      spendingLimit: config.AGENT_SPENDING_LIMIT,
-      assetCode: config.X402_ASSET_CODE,
-    });
+    logger.info(
+      {
+        network: config.STELLAR_NETWORK,
+        horizon: config.HORIZON_URL,
+        soroban: config.SOROBAN_RPC_URL,
+        agentPubkey: config.AGENT_PUBLIC_KEY,
+        spendingLimit: config.AGENT_SPENDING_LIMIT,
+        assetCode: config.X402_ASSET_CODE,
+      },
+      'PayFiAgent initialised'
+    );
   }
 
   /**
@@ -309,12 +920,10 @@ export class PayFiAgent extends EventEmitter {
       .forAccount(config.AGENT_PUBLIC_KEY)
       .stream({
         onmessage: (payment: any) => {
-          const memo: string = payment.memo ?? "";
-          if (!memo.startsWith("x402:")) return;
+          const memo: string = payment.memo ?? '';
+          if (!memo.startsWith('x402:')) return;
           try {
-            const raw: unknown = JSON.parse(
-              Buffer.from(memo.slice(5), "base64").toString("utf8")
-            );
+            const raw: unknown = JSON.parse(Buffer.from(memo.slice(5), 'base64').toString('utf8'));
             const challenge: X402Challenge = X402ChallengeSchema.parse(raw);
             onChallenge(challenge);
           } catch (err) {
@@ -322,18 +931,26 @@ export class PayFiAgent extends EventEmitter {
             // forwarding to onChallenge (or letting Zod's error surface
             // deep inside respond(), where it can't be attributed to the
             // stream that produced it).
-            logger.warn("Dropped invalid x402 challenge memo", {
-              error: err instanceof Error ? err.message : String(err),
-            });
+            logger.warn(
+              {
+                error: err instanceof Error ? err.message : String(err),
+              },
+              'Dropped invalid x402 challenge memo'
+            );
           }
         },
         onerror: (event: MessageEvent) => {
-          logger.warn("Payment stream error", { error: String(event) });
+          logger.warn({ error: String(event) }, 'Payment stream error');
+          // The underlying connection is dead — tear it down so `_streamStop`
+          // doesn't keep pointing at a broken stream forever, which would
+          // otherwise permanently block a future startListening() call (its
+          // early-return guard only checks whether `_streamStop` is set).
+          this.stopListening();
         },
       });
 
     this._streamStop = closeStream as unknown as () => void;
-    logger.info("Payment stream started", { resourceUrl });
+    logger.info({ resourceUrl }, 'Payment stream started');
   }
 
   /** Stop the active Horizon payment stream subscription. */
@@ -341,7 +958,7 @@ export class PayFiAgent extends EventEmitter {
     if (this._streamStop) {
       this._streamStop();
       this._streamStop = null;
-      logger.info("Payment stream stopped");
+      logger.info('Payment stream stopped');
     }
   }
 
@@ -363,7 +980,7 @@ export class PayFiAgent extends EventEmitter {
       this._contractListenerStop();
     }
     this._contractListenerStop = listenContractEvents(contractId, eventTypes, onEvent);
-    logger.info("Contract event listener started", { contractId });
+    logger.info({ contractId }, 'Contract event listener started');
   }
 
   /** Stop the active contract event listener. */
@@ -371,12 +988,68 @@ export class PayFiAgent extends EventEmitter {
     if (this._contractListenerStop) {
       this._contractListenerStop();
       this._contractListenerStop = null;
-      logger.info("Contract event listener stopped");
+      logger.info('Contract event listener stopped');
     }
   }
 
   /**
-   * Detach all registered event listeners and release internal resources.
+   * Start polling a Soroban contract's storage keys for changes.
+   * Calls onChange for each detected key addition, update, or deletion.
+   */
+  startStorageWatcher(
+    options: ContractStorageWatcherOptions,
+    onChange: (event: StorageChangeEvent) => void
+  ): void {
+    if (this._storageWatcherStop) {
+      this._storageWatcherStop();
+    }
+    const handle = watchContractStorage(options);
+    handle.on('change', onChange);
+    this._storageWatcherStop = handle.stop;
+    logger.info({ contractId: options.contractId }, 'Contract storage watcher started');
+  }
+
+  /** Stop the active contract storage watcher. */
+  stopStorageWatcher(): void {
+    if (this._storageWatcherStop) {
+      this._storageWatcherStop();
+      this._storageWatcherStop = null;
+      logger.info('Contract storage watcher stopped');
+    }
+  }
+
+  /**
+   * Fetch a URL with automatic x402 v2 payment handling.
+   *
+   * If the server returns `402 Payment Required` with a Stellar-compatible
+   * `PAYMENT-REQUIRED` header, the agent:
+   *   1. Selects a matching `PaymentRequirements` from `accepts[]` — must use
+   *      the `"exact"` scheme, the agent's CAIP-2 network, and an asset the
+   *      agent is configured to pay.
+   *   2. Runs all guards (asset allow-list, `X402_MAX_PRICE`, spending limit,
+   *      destination policy) **before** touching the signer.
+   *   3. Reserves the spend against the rolling window.
+   *   4. Signs the SAC auth entry via the agent's `Signer` and retries.
+   *   5. Commits the reservation on confirmed settlement (200 + PAYMENT-RESPONSE);
+   *      releases it on any failure so the spend is never double-counted.
+   *
+   * Requirements with an unknown network or asset are rejected with a clear
+   * error before any money moves.
+   *
+   * Non-402 responses are returned as-is without payment.
+   *
+   * @param url - The resource URL.
+   * @param init - Optional `RequestInit` forwarded to both probe and paid requests.
+   * @returns Response and optional `SettleResponse` from the PAYMENT-RESPONSE header.
+   */
+  async fetchPaid(url: string | URL, init?: RequestInit): Promise<X402FetchResult> {
+    if (!this._x402FetchClient) {
+      this._x402FetchClient = new X402FetchClient(this.signer);
+    }
+    return this._x402FetchClient.fetch(url, init);
+  }
+
+  /**
    *
    * Must be called by the lifecycle manager when an agent instance is
    * decommissioned or stopped. Failure to call destroy() prevents the garbage
@@ -391,13 +1064,14 @@ export class PayFiAgent extends EventEmitter {
   destroy(): void {
     this.stopListening();
     this.stopContractListener();
+    this.stopStorageWatcher();
     for (const [event, handler] of this._boundHandlers) {
       this.off(event, handler);
     }
     this._boundHandlers.clear();
     // Remove any listeners added externally after construction
     this.removeAllListeners();
-    logger.info("Agent destroyed — all event listeners removed");
+    logger.info('Agent destroyed — all event listeners removed');
   }
 
   /**
@@ -426,18 +1100,229 @@ export class PayFiAgent extends EventEmitter {
 
   drain(): void {
     this.isDraining = true;
-    logger.info("Agent draining — rejecting new tasks");
+    // Queued tasks have not started, so settle them now rather than letting
+    // them race the hard-kill timer — otherwise their callers hang forever.
+    const queued = this.taskQueue.splice(0);
+    for (const { task, correlationId, resolve } of queued) {
+      resolve(this.shuttingDownResult(task, correlationId));
+    }
+    logger.info({ rejectedQueuedTasks: queued.length }, 'Agent draining — rejecting new tasks');
   }
   async waitForPendingTasks(): Promise<void> {
     if (this.activeTasks === 0) return;
     logger.info("Waiting for pending tasks to finish", { activeTasks: this.activeTasks });
     return new Promise<void>((resolve) => {
+
+  private shuttingDownResult(task: AgentTask, correlationId: string): AgentResult {
+    return {
+      success: false,
+      taskType: task.type,
+      error: new AgentShuttingDownError().message,
+      errorType: ErrorType.AgentShuttingDown,
+      correlationId,
+    };
+  }
+
+  /**
+   * Register a middleware function for pre/post task execution hooks.
+   *
+   * Middleware functions are executed in registration order before the task
+   * is dispatched to the appropriate tool. Each middleware can:
+   * - Inspect and modify the task
+   * - Short-circuit execution by returning a result without calling next()
+   * - Call next() to continue to the next middleware or actual task execution
+   *
+   * @param middleware - Middleware function to register
+   */
+  use(middleware: TaskMiddleware): void {
+    this.middlewares.push(middleware);
+    logger.info({ totalMiddlewares: this.middlewares.length }, 'Middleware registered');
+  }
+
+  /**
+   * Register a tool so `run({ type: tool.name, payload })` dispatches to it.
+   *
+   * The payload is parsed with `tool.inputSchema` before `tool.execute` is
+   * called, so the tool receives validated input. Names must be unique —
+   * registering a name that is already taken throws rather than silently
+   * replacing a built-in tool.
+   *
+   * @param tool - The tool to register.
+   */
+  registerTool<I, O>(tool: AgentTool<I, O>): void {
+    if (this.tools.has(tool.name)) {
+      throw new Error(`A tool named "${tool.name}" is already registered`);
+    }
+    this.tools.set(tool.name, tool);
+  }
+
+  /** Every registered tool, in registration order. */
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  getTools(): AgentTool<any, any>[] {
+    return [...this.tools.values()];
+  }
+
+  // ─── Human-in-the-loop approvals (#736) ───────────────────────────────────
+
+  /**
+   * Hold a task above APPROVAL_THRESHOLD (or any task with `requireApproval`)
+   * as `pending_approval` instead of executing it. Its amount is reserved
+   * against the spending window straight away, so a pile of pending approvals
+   * cannot together exceed the limit, and a notification webhook is sent.
+   *
+   * @returns the pending result, or null when the task does not need approval.
+   */
+  private holdForApproval(task: AgentTask, correlationId: string): AgentResult | null {
+    let amount = taskAmount(task);
+    if (task.requireApproval) {
+      amount = amount ?? '0';
+    } else {
+      if (config.APPROVAL_THRESHOLD === undefined) return null;
+      if (amount === null || !(parseFloat(amount) > parseFloat(config.APPROVAL_THRESHOLD))) {
+        return null;
+      }
+    }
+
+    const reservationIds = reserveTaskSpends(task);
+    const createdAt = Date.now();
+    const approval = {
+      id: randomUUID(),
+      taskType: task.type,
+      payload: task.payload,
+      amount,
+      correlationId,
+      createdAt,
+      expiresAt: createdAt + config.APPROVAL_TTL_MS,
+    };
+    try {
+      savePendingApproval(approval);
+    } catch (err) {
+      for (const reservationId of reservationIds) spendingTracker.release(reservationId);
+      throw err;
+    }
+    this.approvalReservations.set(approval.id, reservationIds);
+    setTimeout(() => this.expireApprovals(), config.APPROVAL_TTL_MS).unref();
+
+    log.warn(
+      { approvalId: approval.id, taskType: task.type, amount, correlationId },
+      'Task held for approval'
+    );
+    const result: AgentResult = {
+      success: false,
+      taskType: task.type,
+      data: {
+        status: 'pending_approval',
+        approvalId: approval.id,
+        expiresAt: new Date(approval.expiresAt).toISOString(),
+      },
+      error: task.requireApproval
+        ? `${task.type} requires human approval — awaiting approval`
+        : `Amount ${amount} exceeds APPROVAL_THRESHOLD of ${config.APPROVAL_THRESHOLD} — awaiting approval`,
+      errorType: ErrorType.PendingApproval,
+      correlationId,
+    };
+    void dispatchWebhook(result);
+    return result;
+  }
+
+  private releaseApprovalReservation(id: string): void {
+    const reservationIds = this.approvalReservations.get(id);
+    if (reservationIds === undefined) return;
+    this.approvalReservations.delete(id);
+    for (const reservationId of reservationIds) spendingTracker.release(reservationId);
+  }
+
+  /** Expire every pending approval past its deadline and release its reservation. */
+  expireApprovals(): void {
+    for (const id of expirePendingApprovals()) {
+      this.releaseApprovalReservation(id);
+      log.warn({ approvalId: id }, 'Pending approval expired');
+    }
+  }
+
+  /** Approvals still waiting for a decision. */
+  listApprovals(): PendingApproval[] {
+    this.expireApprovals();
+    return listPendingApprovals();
+  }
+
+  /**
+   * Approve a pending task and execute it. Only the call that moves the
+   * approval out of `pending_approval` executes the task, so approving twice
+   * runs it once; later calls just return the approval's current state.
+   *
+   * @returns null when no approval has this id.
+   */
+  async approve(id: string): Promise<{ approval: PendingApproval; result?: AgentResult } | null> {
+    this.expireApprovals();
+    const approval = getPendingApproval(id);
+    if (!approval) return null;
+    if (!decideApproval(id, 'approved')) return { approval };
+
+    log.warn({ approvalId: id, taskType: approval.taskType }, 'Pending approval approved');
+    // The task reserves its own amount when it runs.
+    this.releaseApprovalReservation(id);
+    const task: AgentTask = {
+      type: approval.taskType,
+      payload: approval.payload,
+      ...(approval.correlationId ? { correlationId: approval.correlationId } : {}),
+    };
+    this.approvedTasks.add(task);
+    const result = await this.run(task);
+    return { approval: getPendingApproval(id) ?? approval, result };
+  }
+
+  /**
+   * Deny a pending task and release its spending reservation.
+   *
+   * @returns null when no approval has this id.
+   */
+  deny(id: string): PendingApproval | null {
+    this.expireApprovals();
+    if (!getPendingApproval(id)) return null;
+    if (decideApproval(id, 'denied')) {
+      this.releaseApprovalReservation(id);
+      log.warn({ approvalId: id }, 'Pending approval denied');
+    }
+    return getPendingApproval(id) ?? null;
+  }
+
+  /**
+   * Resolve once no tasks are active or queued.
+   *
+   * @param timeoutMs - Give up after this long. Omit to wait indefinitely.
+   * @returns  if every task settled,  if the timeout fired first.
+   */
+  async waitForPendingTasks(timeoutMs?: number): Promise<boolean> {
+    const idle = () => this.activeTasks === 0 && this.taskQueue.length === 0;
+    if (idle()) return true;
+    logger.info(
+      {
+        activeTasks: this.activeTasks,
+        queuedTasks: this.taskQueue.length,
+        timeoutMs,
+      },
+      'Waiting for pending tasks to finish'
+    );
+    return new Promise<boolean>((resolve) => {
+      let timer: ReturnType<typeof setTimeout> | undefined;
       const interval = setInterval(() => {
-        if (this.activeTasks === 0) {
+        if (idle()) {
           clearInterval(interval);
-          resolve();
+          clearTimeout(timer);
+          resolve(true);
         }
       }, 100);
+      if (timeoutMs !== undefined) {
+        timer = setTimeout(() => {
+          clearInterval(interval);
+          logger.warn(
+            { activeTasks: this.activeTasks, queuedTasks: this.taskQueue.length },
+            'Timed out waiting for pending tasks'
+          );
+          resolve(false);
+        }, timeoutMs);
+      }
     });
   }
 
@@ -454,9 +1339,11 @@ export class PayFiAgent extends EventEmitter {
    */
   async runSequence(tasks: AgentTask[]): Promise<AgentResult[]> {
     const results: AgentResult[] = [];
-    for (const task of tasks) {
+    for (const [index, task] of tasks.entries()) {
       const result = await this.run(task);
-      results.push(result);
+      // Stamped on a copy rather than mutating the object `run` already handed
+      // to the "task:failed" listeners and the webhook dispatcher.
+      results.push({ ...result, sequenceIndex: index });
       if (!result.success) break;
     }
     return results;
@@ -467,27 +1354,65 @@ export class PayFiAgent extends EventEmitter {
     // Correlation ID ties together every log line, event, persisted result,
     // and webhook for this single task execution. Reuse the caller's if given.
     const correlationId = task.correlationId ?? generateCorrelationId();
-    const taskLog = createLogger("orchestrator", correlationId);
+    const taskLog = createLogger('orchestrator', correlationId);
 
     if (this.isDraining) {
-      return {
-        success: false,
-        taskType: task.type,
-        error: "Agent is shutting down — task rejected",
-        correlationId,
-      };
+      return this.shuttingDownResult(task, correlationId);
     }
 
-    // ── Concurrency rate limit — reject rather than queue when saturated ──
+    // ── Idempotency check (#payment-idempotency) ─────────────────────────────
+    if (task.idempotencyKey) {
+      const existing = getIdempotencyResult(task.idempotencyKey, task.payload);
+      if (existing && 'conflict' in existing) {
+        return {
+          success: false,
+          taskType: task.type,
+          error: `Idempotency key "${task.idempotencyKey}" already used with a different payload`,
+          errorType: ErrorType.IdempotencyConflict,
+          correlationId,
+        };
+      }
+      if (existing) {
+        taskLog.info(
+          { idempotencyKey: task.idempotencyKey },
+          'Returning cached result for idempotent request'
+        );
+        return { ...existing, correlationId };
+      }
+    }
+
+    // ── Concurrency rate limit — queue when saturated if queueCapacity allows,
+    // otherwise reject ──
     if (this.activeTasks >= config.MAX_CONCURRENT_TASKS) {
+      if (config.QUEUE_CAPACITY > 0 && this.taskQueue.length < config.QUEUE_CAPACITY) {
+        taskLog.info(
+          {
+            taskType: task.type,
+            activeTasks: this.activeTasks,
+            queueLength: this.taskQueue.length + 1,
+          },
+          'Agent at capacity — task queued'
+        );
+        this.emit('task:queued', {
+          taskType: task.type,
+          correlationId,
+          queueLength: this.taskQueue.length + 1,
+        });
+        return new Promise<AgentResult>((resolve) => {
+          this.taskQueue.push({ task, correlationId, resolve });
+          queueDepth.set(this.taskQueue.length);
+        });
+      }
+
       taskLog.warn(
         {
           taskType: task.type,
           activeTasks: this.activeTasks,
           maxConcurrentTasks: config.MAX_CONCURRENT_TASKS,
         },
-        "Task rejected — max concurrent tasks reached"
+        'Task rejected — max concurrent tasks reached'
       );
+      recordTask(task.type, 'rejected');
       return {
         success: false,
         taskType: task.type,
@@ -498,6 +1423,49 @@ export class PayFiAgent extends EventEmitter {
       };
     }
 
+    return this.executeInstrumented(task, correlationId, taskLog);
+  }
+
+  /**
+   * Run executeTask() and record its outcome and latency in the Prometheus
+   * metrics (backend/metrics.ts). Kept outside executeTask() so every exit
+   * path — success, tool failure, middleware throw — is counted exactly once.
+   */
+  private async executeInstrumented(
+    task: AgentTask,
+    correlationId: string,
+    taskLog: ReturnType<typeof createLogger>
+  ): Promise<AgentResult> {
+    const startedAt = process.hrtime.bigint();
+    const result = await this.executeTask(task, correlationId, taskLog);
+    const durationSeconds = Number(process.hrtime.bigint() - startedAt) / 1e9;
+    recordTask(task.type, result.success ? 'success' : 'failure', durationSeconds);
+    return result;
+  }
+
+  /**
+   * Pull the next queued task (if any) and dispatch it once a concurrency
+   * slot frees up. Called from executeTask()'s `finally` block.
+   */
+  private dispatchQueued(): void {
+    if (this.taskQueue.length === 0) return;
+    if (this.activeTasks >= config.MAX_CONCURRENT_TASKS) return;
+    const next = this.taskQueue.shift();
+    queueDepth.set(this.taskQueue.length);
+    if (!next) return;
+    void this.executeInstrumented(
+      next.task,
+      next.correlationId,
+      createLogger('orchestrator', next.correlationId)
+    ).then(next.resolve);
+  }
+
+  /** Run a task's tool logic — assumes the concurrency slot has already been reserved. */
+  private async executeTask(
+    task: AgentTask,
+    correlationId: string,
+    taskLog: ReturnType<typeof createLogger>
+  ): Promise<AgentResult> {
     this.activeTasks++;
     taskLog.info({ taskType: task.type }, "Running task");
     try {
@@ -527,174 +1495,354 @@ export class PayFiAgent extends EventEmitter {
       }
 
       let data: unknown;
+    this.emit('task:started', { taskType: task.type, correlationId });
+    const startMs = Date.now();
 
-      switch (task.type) {
-        case "stellar_payment": {
-          // issue #729 — reserve before submit, commit/release after
-          const p = task.payload as Record<string, unknown>;
-          const reservationId = reserveSpendingLimit(p?.amount);
-          try {
-            data = await this.paymentTool.execute(task.payload);
-            if (reservationId !== null) spendingTracker.commit(reservationId);
-          } catch (toolErr) {
-            if (reservationId !== null) spendingTracker.release(reservationId);
-            throw toolErr;
+    taskLog.info({ taskType: task.type }, 'Running task');
+
+    // ── Compose middleware chain ────────────────────────────────────────────────
+    const executeTask = async (): Promise<AgentResult> => {
+      // Spending reservations taken for this run (#729): committed once the
+      // tool succeeds, released if anything before that throws.
+      let reservationIds: string[] = [];
+      try {
+        if (VALUE_MOVING_TASK_TYPES.has(task.type) && isPaused()) {
+          throw new AgentPausedError(
+            `Agent is paused — ${task.type} is halted until an operator resumes it`
+          );
+        }
+
+        if (VALUE_MOVING_TASK_TYPES.has(task.type)) {
+          assertDestinationsAllowed(task);
+        }
+
+        if (VALUE_MOVING_TASK_TYPES.has(task.type) && !this.approvedTasks.has(task)) {
+          const held = this.holdForApproval(task, correlationId);
+          if (held) return held;
+        }
+
+        reservationIds = reserveTaskSpends(task);
+
+        let data: unknown;
+
+        switch (task.type) {
+          case 'stellar_payment': {
+            const paymentResult = await this.paymentTool.execute(task.payload);
+            data = {
+              ...paymentResult,
+              network: config.STELLAR_NETWORK,
+            };
+            break;
           }
-          break;
-        }
 
-        case "soroban_invoke": {
-          data = await this.sorobanTool.execute(task.payload);
-          break;
-        }
+          case 'soroban_invoke': {
+            data = await this.sorobanTool.execute(task.payload);
+            break;
+          }
 
-        case "soroban_query":
-          data = await this.sorobanQueryTool.query(task.payload);
-          break;
+          case 'soroban_query':
+            data = await this.sorobanQueryTool.query(task.payload);
+            break;
 
-        case "x402_respond": {
-          // issue #729 — reserve before submit, commit/release after
-          const p = task.payload as Record<string, unknown>;
-          const reservationId = reserveSpendingLimit(p?.amount);
-          try {
+          case 'x402_respond':
             data = await this.x402Tool.respond(task.payload);
-            if (reservationId !== null) spendingTracker.commit(reservationId);
-          } catch (toolErr) {
-            if (reservationId !== null) spendingTracker.release(reservationId);
-            throw toolErr;
-          }
-          break;
-        }
+            break;
 
-        case "account_info":
-          data = await this.accountInfoTool.fetch();
-          break;
+          case 'account_info':
+            data = await this.accountInfoTool.fetch();
+            break;
 
-        case "change_trust":
-          data = await this.trustlineTool.execute(task.payload);
-          break;
+          case 'change_trust':
+            data = await this.trustlineTool.execute(task.payload);
+            break;
 
-        case "multisig_payment": {
-          // issue #728 — multisig_payment was unguarded; apply spending limit
-          // Only guard when enough signatures are present (i.e., the tx will be submitted).
-          // When returning unsignedXDR no funds move, so no reservation needed.
-          const p = task.payload as Record<string, unknown>;
-          const sigs = Array.isArray(p?.signatures) ? p.signatures : [];
-          const minSig = typeof p?.minSignatures === "number" ? p.minSignatures : 1;
-          const willSubmit = sigs.length >= minSig;
-          const reservationId = willSubmit ? reserveSpendingLimit(p?.amount) : null;
-          try {
+          case 'multisig_payment':
             data = await this.multiSigTool.execute(task.payload);
-            if (reservationId !== null) spendingTracker.commit(reservationId);
-          } catch (toolErr) {
-            if (reservationId !== null) spendingTracker.release(reservationId);
-            throw toolErr;
-          }
-          break;
-        }
+            break;
 
-        case "batch_payment": {
-          // issue #728 — batch_payment had its own aggregate check but never
-          // recorded into the rolling window. Compute total, reserve it, then
-          // commit/release based on submission outcome.
-          const p = task.payload as Record<string, unknown>;
-          const payments = Array.isArray(p?.payments) ? p.payments : [];
-          const batchTotal = payments.reduce((sum: number, pay: unknown) => {
-            const amt = parseFloat((pay as Record<string, unknown>)?.amount as string);
-            return sum + (isNaN(amt) ? 0 : amt);
-          }, 0);
-          const batchTotalStr = String(batchTotal);
-          const reservationId = reserveSpendingLimit(batchTotalStr);
-          try {
+          case 'batch_payment':
             data = await this.batchPaymentTool.execute(task.payload);
-            if (reservationId !== null) spendingTracker.commit(reservationId);
-          } catch (toolErr) {
-            if (reservationId !== null) spendingTracker.release(reservationId);
-            throw toolErr;
+            break;
+
+          case 'balance_check': {
+            const balanceCheckTool = this.balanceCheckTool as {
+              execute?: (payload: unknown) => Promise<unknown>;
+              getBalance?: (payload: unknown) => Promise<unknown>;
+            };
+            if (typeof balanceCheckTool.execute === 'function') {
+              data = await balanceCheckTool.execute(task.payload);
+            } else if (typeof balanceCheckTool.getBalance === 'function') {
+              data = await balanceCheckTool.getBalance(task.payload);
+            } else {
+              throw new Error('Balance check tool does not implement execute() or getBalance().');
+            }
+            break;
           }
-          break;
-        }
 
-        case "balance_check":
-          data = await this.balanceCheckTool.getBalance(task.payload);
-          break;
-
-        case "path_payment": {
-          // issue #728 — path_payment was entirely unguarded; sendAmount is the
-          // field that moves funds.
-          const p = task.payload as Record<string, unknown>;
-          const reservationId = reserveSpendingLimit(p?.sendAmount);
-          try {
+          case 'path_payment':
             data = await this.pathPaymentTool.execute(task.payload);
-            if (reservationId !== null) spendingTracker.commit(reservationId);
-          } catch (toolErr) {
-            if (reservationId !== null) spendingTracker.release(reservationId);
-            throw toolErr;
-          }
-          break;
-        }
+            break;
 
-        case "fee_bump": {
-          // issue #728 — fee_bump pays fees on behalf of the inner tx; the fee
-          // is not a user-specified numeric field, so we guard the baseFeeMultiplier
-          // signal by checking against a sentinel value.  The inner-tx fee is
-          // typically < 1 XLM and not tracked; this guard prevents runaway
-          // fee-bump usage from bypassing the window entirely.
-          // We skip the spending-limit guard for fee_bump because its cost is
-          // denominated in stroops (fractions of XLM) and the tool validates
-          // the multiplier itself.  The task type is included in the window
-          // audit log via taskLog below.
-          data = await this.feeBumpTool.execute(task.payload);
-          break;
-        }
+          case 'fee_bump':
+            data = await this.feeBumpTool.execute(task.payload);
+            break;
 
-        case "dex_offer": {
-          // issue #728 — dex_offer sell-amount moves funds; guard the amount field.
-          // delete actions set amount to "0" internally so they pass through.
-          const p = task.payload as Record<string, unknown>;
-          const reservationId = reserveSpendingLimit(p?.amount);
-          try {
+          case 'dex_offer':
             data = await this.dexOfferTool.execute(task.payload);
-            if (reservationId !== null) spendingTracker.commit(reservationId);
-          } catch (toolErr) {
-            if (reservationId !== null) spendingTracker.release(reservationId);
-            throw toolErr;
+            break;
+
+          case 'swap':
+            data = await this.swapTool.execute(task.payload);
+            break;
+
+          case 'account_history':
+            data = await this.accountHistoryTool.fetch(task.payload);
+            break;
+
+          case 'soroban_deploy':
+            data = await this.sorobanDeployTool.execute(task.payload);
+            break;
+
+          case 'liquidity_pool':
+            data = await this.liquidityPoolTool.execute(task.payload);
+            break;
+
+          case 'stellar_toml':
+            data = await this.stellarTomlTool.fetchToml(task.payload);
+            break;
+
+          case 'data_entry':
+            data = await this.dataEntryTool.execute(task.payload);
+            break;
+
+          case 'sequence_number':
+            data = await this.sequenceNumberTool.execute(task.payload);
+            break;
+
+          case 'sponsored_account':
+            data = await this.sponsoredAccountTool.execute(task.payload);
+            break;
+
+          case 'anchor_quote':
+            data = await this.anchorQuoteTool.execute(task.payload);
+            break;
+
+          case 'set_options':
+            data = await this.setOptionsTool.execute(task.payload);
+            break;
+
+          case 'soroban_event_query':
+            data = await this.sorobanEventIndexerTool.query(task.payload);
+            break;
+
+          case 'stellar_identity_auth':
+            data = await this.stellarIdentityTool.execute(task.payload);
+            break;
+
+          case 'friendbot':
+            data = await this.friendBotTool.execute(task.payload);
+            break;
+
+          case 'nano_payment':
+            data = await this.nanoPaymentTool.execute(task.payload);
+            break;
+
+          default: {
+            // Registry dispatch (#746): built-in tools without a case above and
+            // custom tools added with registerTool().
+            const tool = this.tools.get(task.type);
+            if (!tool) {
+              throw new Error(`Unknown task type: ${(task as AgentTask).type}`);
+            }
+            const ctx: ToolContext = {
+              correlationId,
+              logger: taskLog,
+              network: config.STELLAR_NETWORK,
+              // Reserved like the built-in payments above (#729): committed
+              // once the tool succeeds, released if it throws.
+              assertWithinSpendingLimit: (amount) => {
+                if (typeof amount !== 'string') return; // the tool's schema rejects it
+                reservationIds.push(
+                  reserveSpendingLimit({
+                    amount,
+                    assetKey: assetKey(config.X402_ASSET_CODE, config.X402_ASSET_ISSUER),
+                  })
+                );
+              },
+            };
+            const input = tool.inputSchema.parse(task.payload);
+            data = await withSpan(
+              `tool.${task.type}`,
+              async (span) => {
+                const toolData: unknown = await tool.execute(input, ctx);
+                setTxHashAttribute(span, toolData);
+                return toolData;
+              },
+              { [SPAN_ATTR.TASK_TYPE]: task.type, [SPAN_ATTR.CORRELATION_ID]: correlationId }
+            );
+            break;
           }
-          break;
         }
 
-        default:
-          throw new Error(`Unknown task type: ${(task as AgentTask).type}`);
+        for (const id of reservationIds) spendingTracker.commit(id);
+        reservationIds = [];
+
+        // ── Persist successful result with duration ───────────────────────────────
+        const durationMs = Date.now() - startMs;
+        taskLog.info({ taskType: task.type, durationMs }, 'Task completed');
+        const result: AgentResult = {
+          success: true,
+          taskType: task.type,
+          data,
+          correlationId,
+          durationMs,
+        };
+        this.emit('task:complete', result);
+
+        // Persist result for all paths (#failed-results-persistence)
+        const timestamp = new Date().toISOString();
+        saveResult({ ...result, timestamp });
+
+        // Store idempotency result if key provided (#payment-idempotency)
+        if (task.idempotencyKey) {
+          saveIdempotencyResult(task.idempotencyKey, task.type, task.payload, result);
+        }
+
+        // The transaction is already on-chain at this point, so an audit-log
+        // failure is logged loudly rather than reported as a task failure that
+        // could prompt the caller to resubmit the payment.
+        try {
+          const auditEntry = buildAuditEntry(task, data, correlationId, timestamp);
+          if (auditEntry) appendAuditEntry(auditEntry);
+        } catch (auditErr) {
+          taskLog.error(
+            {
+              taskType: task.type,
+              error: redactSecretString(describeError(auditErr)),
+            },
+            'Failed to append audit log entry'
+          );
+        }
+
+        void dispatchWebhook(result);
+
+        return result;
+      } catch (err) {
+        for (const id of reservationIds) spendingTracker.release(id);
+        reservationIds = [];
+        const safe = redactSecretString(describeError(err));
+        const sanitized = sanitizePayload(task.payload);
+        taskLog.error(
+          { taskType: task.type, error: safe, sanitizedPayload: sanitized },
+          'Task failed'
+        );
+        const durationMs = Date.now() - startMs;
+        const result: AgentResult = {
+          success: false,
+          taskType: task.type,
+          error: safe,
+          errorType: getErrorType(err),
+          correlationId,
+          durationMs,
+        };
+        this.emit('task:failed', result);
+
+        // Persist failed result (#failed-results-persistence)
+        const timestamp = new Date().toISOString();
+        saveResult({ ...result, timestamp });
+
+        // Store idempotency result for failures too (#payment-idempotency)
+        if (task.idempotencyKey) {
+          saveIdempotencyResult(task.idempotencyKey, task.type, task.payload, result);
+        }
+
+        void dispatchWebhook(result);
+        return result;
       }
+    };
 
-      taskLog.info({ taskType: task.type }, "Task completed");
-      const result: AgentResult = { success: true, taskType: task.type, data, correlationId };
-      this.emit("task:complete", result);
+    // Build middleware chain: middleware[n] -> middleware[n-1] -> ... -> executeTask
+    let chain: () => Promise<AgentResult> = executeTask;
+    for (let i = this.middlewares.length - 1; i >= 0; i--) {
+      const middleware = this.middlewares[i];
+      if (!middleware) continue;
+      const next: () => Promise<AgentResult> = chain;
+      chain = () => middleware(task, next);
+    }
 
-      saveResult({ ...result, timestamp: new Date().toISOString() });
-      void dispatchWebhook(result);
-
+    try {
+      // Lets rpc_client emit task:retry / tx:* on this agent for this task.
+      const result = await taskContext.run(
+        { taskType: task.type, correlationId, emit: this.emit.bind(this) },
+        () =>
+          // Root span for the task (#823): tool spans and RPC spans nest under it,
+          // and the correlation ID links the trace to the task's log lines.
+          withSpan(
+            'agent.executeTask',
+            async (span) => {
+              const taskResult = await chain();
+              if (taskResult.success) {
+                setTxHashAttribute(span, taskResult.data);
+              } else {
+                markSpanError(span, taskResult.error ?? 'Task failed');
+              }
+              return taskResult;
+            },
+            { [SPAN_ATTR.TASK_TYPE]: task.type, [SPAN_ATTR.CORRELATION_ID]: correlationId }
+          )
+      );
+      if (result.success) {
+        failureAlerts.recordSuccess();
+      } else {
+        failureAlerts.recordFailure(task.type);
+      }
       return result;
     } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      const safe = redactSecretString(message);
+      failureAlerts.recordFailure(task.type);
+      const durationMs = Date.now() - startMs;
+      const safe = redactSecretString(describeError(err));
       const sanitized = sanitizePayload(task.payload);
       taskLog.error(
-        { taskType: task.type, error: safe, sanitizedPayload: sanitized },
-        "Task failed"
+        { taskType: task.type, error: safe, sanitizedPayload: sanitized, durationMs },
+        'Task failed'
       );
+      const isStellarRpcError =
+        !!rpcClient.StellarRPCError && err instanceof rpcClient.StellarRPCError;
+      if (isStellarRpcError) {
+        this.emit('task:retry_exhausted', { taskType: task.type, attempts: config.MAX_RETRIES });
+      }
       const result: AgentResult = {
         success: false,
         taskType: task.type,
         error: safe,
         errorType: getErrorType(err),
         correlationId,
+        durationMs,
       };
-      this.emit("task:failed", result);
+      this.emit('task:failed', result);
+
+      // Persist middleware failure result
+      const timestamp = new Date().toISOString();
+      saveResult({ ...result, timestamp });
+
+      // Store idempotency result for middleware failures too
+      if (task.idempotencyKey) {
+        saveIdempotencyResult(task.idempotencyKey, task.type, task.payload, result);
+      }
+
       void dispatchWebhook(result);
       return result;
     } finally {
       this.activeTasks--;
+      this.dispatchQueued();
+      // Periodically prune expired idempotency keys
+      if (Math.random() < 0.01) {
+        try {
+          pruneIdempotencyKeys();
+        } catch {
+          // Ignore pruning errors - it's a cleanup operation
+        }
+      }
     }
   }
 }

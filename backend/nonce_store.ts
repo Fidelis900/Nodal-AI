@@ -11,23 +11,39 @@
  *     SQLite database (same DB_PATH used by persistence.ts)
  *   • InMemoryNonceStore — lightweight in-process store for unit tests
  *
- * For multi-instance deployments, inject a custom INonceStore backed by a
- * shared store (e.g., Redis, DynamoDB) via the X402PaymentTool constructor.
+ * For multi-instance deployments, set STORAGE_BACKEND=postgres to use
+ * PostgresNonceStore (backend/db/postgres.ts), or inject any other INonceStore
+ * backed by a shared store via the X402PaymentTool constructor.
  *
  * Nonce TTL
  * ---------
  * X402 challenges carry an `expiresAt` field.  Once a challenge has expired
- * it can never be replayed legitimately, so nonces older than
- * MAX_NONCE_TTL_MS can be pruned.  The default TTL is 24 hours — well above
- * the expected maximum challenge lifetime — so no valid nonce is discarded
- * prematurely.
+ * it can never be replayed legitimately, so nonces older than the configured
+ * TTL can be pruned.  The TTL comes from `X402_NONCE_TTL_MS` and defaults to
+ * 24 hours — well above the expected maximum challenge lifetime — so no valid
+ * nonce is discarded prematurely.
+ *
+ * Eviction runs on every has()/add() call, so a long-running agent's store stays
+ * bounded by the TTL window without any caller having to schedule pruning.
  */
 
-import Database from "better-sqlite3";
+import Database from 'better-sqlite3';
+
+import { config } from './config';
+import { migrateSqlite } from './db/migrate';
 
 // Maximum age (ms) after which a stored nonce may be pruned.
 // Set to 24 hours to cover the widest plausible challenge expiry window.
 export const MAX_NONCE_TTL_MS = 24 * 60 * 60 * 1_000;
+
+/**
+ * Configured nonce lifetime, falling back to MAX_NONCE_TTL_MS when config has
+ * not been loaded (unit tests frequently mock the config module wholesale).
+ */
+export function configuredTtlMs(): number {
+  const fromConfig = (config as { X402_NONCE_TTL_MS?: number } | undefined)?.X402_NONCE_TTL_MS;
+  return typeof fromConfig === 'number' && fromConfig > 0 ? fromConfig : MAX_NONCE_TTL_MS;
+}
 
 // ─── Interface ────────────────────────────────────────────────────────────────
 
@@ -68,63 +84,71 @@ export interface INonceStore {
  * (DB_PATH env var, default "./agent.db") so no extra infrastructure is
  * required.
  *
- * Schema (created lazily on first use):
- *   CREATE TABLE IF NOT EXISTS x402_used_nonces (
- *     nonce      TEXT PRIMARY KEY,
- *     used_at_ms INTEGER NOT NULL
- *   );
+ * Schema: `x402_used_nonces (nonce TEXT PRIMARY KEY, used_at_ms INTEGER)`,
+ * created by `backend/db/migrations/001_initial_schema.sql`. Pending
+ * migrations are applied on first use, so an injected connection works too.
  *
  * All operations are synchronous at the SQLite level (better-sqlite3 API),
  * wrapped in Promise.resolve() to satisfy the async INonceStore interface
  * and keep call-sites uniform regardless of backend.
+ *
+ * IMPORTANT: The connection should be the shared one from persistence.getDb()
+ * to avoid opening multiple connections per process. See X402PaymentTool constructor.
  */
 export class SqliteNonceStore implements INonceStore {
   private db: Database.Database;
   private ready = false;
+  private ownsConnection: boolean;
 
-  constructor(db: Database.Database) {
-    this.db = db;
+  /**
+   * @param db - The SQLite database connection. If provided, this store will use
+   *            the shared connection. If not provided, a new connection is created
+   *            for backward compatibility (deprecated).
+   */
+  constructor(db?: Database.Database) {
+    if (db) {
+      this.db = db;
+      this.ownsConnection = false;
+    } else {
+      this.db = new Database(config.DB_PATH);
+      this.ownsConnection = true;
+    }
+  }
+
+  /**
+   * Close the connection if this store owns it. Does nothing if using a shared connection.
+   */
+  close(): void {
+    if (this.ownsConnection && this.db) {
+      this.db.close();
+    }
   }
 
   private ensureTable(): void {
     if (this.ready) return;
-    this.db.exec(`
-      CREATE TABLE IF NOT EXISTS x402_used_nonces (
-        nonce      TEXT    PRIMARY KEY,
-        used_at_ms INTEGER NOT NULL
-      )
-    `);
-    // Index for efficient TTL pruning by timestamp.
-    this.db.exec(`
-      CREATE INDEX IF NOT EXISTS idx_x402_nonces_used_at
-        ON x402_used_nonces (used_at_ms)
-    `);
+    migrateSqlite(this.db);
     this.ready = true;
   }
 
   async has(nonce: string): Promise<boolean> {
     this.ensureTable();
-    const row = this.db
-      .prepare("SELECT 1 FROM x402_used_nonces WHERE nonce = ?")
-      .get(nonce);
+    await this.prune();
+    const row = this.db.prepare('SELECT 1 FROM x402_used_nonces WHERE nonce = ?').get(nonce);
     return row !== undefined;
   }
 
   async add(nonce: string): Promise<void> {
     this.ensureTable();
+    await this.prune();
     this.db
-      .prepare(
-        "INSERT OR IGNORE INTO x402_used_nonces (nonce, used_at_ms) VALUES (?, ?)"
-      )
+      .prepare('INSERT OR IGNORE INTO x402_used_nonces (nonce, used_at_ms) VALUES (?, ?)')
       .run(nonce, Date.now());
   }
 
-  async prune(ttlMs: number = MAX_NONCE_TTL_MS): Promise<void> {
+  async prune(ttlMs: number = configuredTtlMs()): Promise<void> {
     this.ensureTable();
     const cutoff = Date.now() - ttlMs;
-    this.db
-      .prepare("DELETE FROM x402_used_nonces WHERE used_at_ms < ?")
-      .run(cutoff);
+    this.db.prepare('DELETE FROM x402_used_nonces WHERE used_at_ms < ?').run(cutoff);
   }
 }
 
@@ -140,16 +164,23 @@ export class InMemoryNonceStore implements INonceStore {
   private nonces = new Map<string, number>();
 
   async has(nonce: string): Promise<boolean> {
+    await this.prune();
     return this.nonces.has(nonce);
   }
 
   async add(nonce: string): Promise<void> {
+    await this.prune();
     if (!this.nonces.has(nonce)) {
       this.nonces.set(nonce, Date.now());
     }
   }
 
-  async prune(ttlMs: number = MAX_NONCE_TTL_MS): Promise<void> {
+  /** Number of nonces currently retained. Exposed so tests can assert bounding. */
+  get size(): number {
+    return this.nonces.size;
+  }
+
+  async prune(ttlMs: number = configuredTtlMs()): Promise<void> {
     const cutoff = Date.now() - ttlMs;
     for (const [nonce, ts] of this.nonces) {
       if (ts < cutoff) {
