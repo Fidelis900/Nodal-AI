@@ -25,6 +25,16 @@ jobs:
         with:
           node-version: 22
 
+      - name: Validate CHANGELOG.md contains release entry
+        run: |
+          TAG_NAME="${{ github.ref_name }}"
+          VERSION="${TAG_NAME#v}"
+          if ! grep -q "## \[$VERSION\]" CHANGELOG.md; then
+            echo "::error::CHANGELOG.md is missing an entry for release $VERSION ($TAG_NAME)"
+            exit 1
+          fi
+          echo "Verified CHANGELOG.md contains entry for $VERSION."
+
       - name: Generate changelog
         run: npx conventional-changelog -p angular -i CHANGELOG.md -s
 
