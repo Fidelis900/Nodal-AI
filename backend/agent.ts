@@ -25,6 +25,8 @@ import {
   listPendingApprovals,
   decideApproval,
   expirePendingApprovals,
+  saveAgentState,
+  loadAgentState,
   getIdempotencyResult,
   saveIdempotencyResult,
   pruneIdempotencyKeys,
@@ -1086,6 +1088,7 @@ export class PayFiAgent extends EventEmitter<AgentEvents> {
     };
     try {
       savePendingApproval(approval);
+      saveAgentState(`approval_reservations:${approval.id}`, JSON.stringify(reservationIds));
     } catch (err) {
       for (const reservationId of reservationIds) spendingTracker.release(reservationId);
       throw err;
@@ -1116,9 +1119,24 @@ export class PayFiAgent extends EventEmitter<AgentEvents> {
   }
 
   private releaseApprovalReservation(id: string): void {
-    const reservationIds = this.approvalReservations.get(id);
+    let reservationIds = this.approvalReservations.get(id);
+    if (reservationIds === undefined) {
+      try {
+        const stored = loadAgentState(`approval_reservations:${id}`);
+        if (stored) {
+          reservationIds = JSON.parse(stored) as string[];
+        }
+      } catch {
+        // ignore
+      }
+    }
     if (reservationIds === undefined) return;
     this.approvalReservations.delete(id);
+    try {
+      saveAgentState(`approval_reservations:${id}`, '');
+    } catch {
+      // ignore
+    }
     for (const reservationId of reservationIds) spendingTracker.release(reservationId);
   }
 
