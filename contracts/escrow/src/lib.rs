@@ -49,7 +49,7 @@
 
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, panic_with_error,
-    token::Client as TokenClient, Address, Env, Symbol,
+    token::Client as TokenClient, Address, Env, Symbol, Vec,
 };
 
 // ─── Security constants ───────────────────────────────────────────────────────
@@ -155,6 +155,9 @@ pub enum EscrowError {
     InvalidFee = 12,
     /// The caller is not the authorized recipient.
     NotRecipient = 13,
+    /// The token is not on the configured allowlist, or `set_allowed_tokens`
+    /// was called with an empty list or after setup already completed.
+    InvalidToken = 14,
 }
 
 // ─── Contract ─────────────────────────────────────────────────────────────────
@@ -170,6 +173,44 @@ pub struct EscrowContract;
 
 #[contractimpl]
 impl EscrowContract {
+    /// Configure an optional on-chain allowlist of token contract addresses
+    /// that `initialize` / `initialize_with_fee` will accept for this escrow
+    /// instance. When set, a `token` outside the list is rejected; when never
+    /// called, any token is accepted (unrestricted, matching prior behaviour).
+    ///
+    /// This SDK version has no atomic constructor, so — like every other
+    /// setup call on this contract — it must be submitted by the deployer
+    /// before `initialize`, with no identity to authenticate against yet.
+    /// Call it right after deployment, before sharing the contract id with
+    /// the depositor (#989).
+    ///
+    /// # Panics
+    /// * `AlreadyInitialized` - If the escrow has already been initialised,
+    ///   or the allowlist has already been configured.
+    /// * `InvalidToken` - If `tokens` is empty.
+    //@ requires !has(Depositor) && !has(AllowedTokens)
+    //@ requires tokens.len() > 0
+    //@ ensures stored_allowed_tokens == tokens
+    pub fn set_allowed_tokens(env: Env, tokens: Vec<Address>) {
+        if env.storage().instance().has(&DataKey::Depositor) {
+            panic_with_error!(&env, EscrowError::AlreadyInitialized);
+        }
+        if env.storage().instance().has(&DataKey::AllowedTokens) {
+            panic_with_error!(&env, EscrowError::AlreadyInitialized);
+        }
+        if tokens.is_empty() {
+            panic_with_error!(&env, EscrowError::InvalidToken);
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::AllowedTokens, &tokens);
+    }
+
+    /// Return the configured token allowlist, or `None` if unrestricted.
+    pub fn get_allowed_tokens(env: Env) -> Option<Vec<Address>> {
+        env.storage().instance().get(&DataKey::AllowedTokens)
+    }
+
     /// Initialise the escrow and transfer funds from depositor to contract.
     ///
     /// # Arguments
@@ -1006,6 +1047,20 @@ impl EscrowContract {
         }
         if fee_bps > MAX_FEE_BPS {
             panic_with_error!(&env, EscrowError::InvalidFee);
+        }
+
+        // Reject a token outside the configured allowlist (#989). A malicious
+        // token contract can lie about `transfer`/balances or re-enter; when
+        // `set_allowed_tokens` has restricted this instance to known-good
+        // tokens, anything else is refused before any funds move.
+        if let Some(allowed) = env
+            .storage()
+            .instance()
+            .get::<_, Vec<Address>>(&DataKey::AllowedTokens)
+        {
+            if !allowed.contains(&token) {
+                panic_with_error!(&env, EscrowError::InvalidToken);
+            }
         }
 
         // Pull funds from depositor

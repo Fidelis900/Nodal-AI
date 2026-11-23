@@ -86,9 +86,8 @@ const pinoOptions = {
   }),
 };
 
-export const logger = isMCPStdio && !isDev
-  ? pino(pinoOptions, pino.destination(2))
-  : pino(pinoOptions);
+export const logger =
+  isMCPStdio && !isDev ? pino(pinoOptions, pino.destination(2)) : pino(pinoOptions);
 
 /**
  * Returns a child logger pre-tagged with `component` and an optional `correlationId`.

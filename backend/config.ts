@@ -27,6 +27,28 @@ import { toStroops, tryToStroops } from './utils/amount';
 
 export const MAINNET_SPENDING_CAP = 10_000;
 
+/**
+ * Validates a comma-separated asset allowlist: each entry must be "XLM" or
+ * "CODE:ISSUER" (code <= 12 chars, issuer a valid Ed25519 public key).
+ * Shared by X402_ALLOWED_ASSETS and ESCROW_ALLOWED_TOKENS.
+ */
+function isValidAssetAllowlist(val: string): boolean {
+  return val
+    .split(',')
+    .map((entry) => entry.trim())
+    .every((entry) => {
+      if (entry === 'XLM') return true;
+      const [code, issuer, ...extra] = entry.split(':');
+      return (
+        extra.length === 0 &&
+        !!code &&
+        code.length <= 12 &&
+        !!issuer &&
+        isValidStellarPublicKey(issuer)
+      );
+    });
+}
+
 // Load .env file (no-op when running in CI / production with real env vars)
 dotenv.config();
 
@@ -160,24 +182,22 @@ export const EnvSchema = z.object({
   // Unset = any asset, but a known code must still use its configured issuer.
   X402_ALLOWED_ASSETS: z
     .string()
-    .refine(
-      (val) =>
-        val
-          .split(',')
-          .map((entry) => entry.trim())
-          .every((entry) => {
-            if (entry === 'XLM') return true;
-            const [code, issuer, ...extra] = entry.split(':');
-            return (
-              extra.length === 0 &&
-              !!code &&
-              code.length <= 12 &&
-              !!issuer &&
-              isValidStellarPublicKey(issuer)
-            );
-          }),
-      { message: 'X402_ALLOWED_ASSETS must be a comma-separated list of "XLM" or "CODE:ISSUER"' }
-    )
+    .refine(isValidAssetAllowlist, {
+      message: 'X402_ALLOWED_ASSETS must be a comma-separated list of "XLM" or "CODE:ISSUER"',
+    })
+    .optional(),
+
+  // Comma-separated allowlist of tokens the backend will accept as an escrow
+  // `token` argument, each "XLM" or "CODE:ISSUER" (#989). Unset = only native
+  // XLM and the default x402 asset (X402_ASSET_CODE/ISSUER) are accepted — the
+  // backend never passes an arbitrary, unverified token contract to the escrow
+  // contract's initialize()/initialize_with_fee(), since a malicious token
+  // can lie about transfer()/balances or re-enter.
+  ESCROW_ALLOWED_TOKENS: z
+    .string()
+    .refine(isValidAssetAllowlist, {
+      message: 'ESCROW_ALLOWED_TOKENS must be a comma-separated list of "XLM" or "CODE:ISSUER"',
+    })
     .optional(),
 
   // Spending cap
@@ -646,6 +666,14 @@ export interface AgentConfig {
    * known code (X402_ASSET_CODE) must use its configured issuer.
    */
   readonly X402_ALLOWED_ASSETS?: string | undefined;
+
+  /**
+   * Comma-separated allowlist of tokens the backend will accept as an escrow
+   * `token` argument, each "XLM" or "CODE:ISSUER". Optional — when unset,
+   * only native XLM and the default x402 asset (X402_ASSET_CODE/ISSUER) are
+   * accepted (#989).
+   */
+  readonly ESCROW_ALLOWED_TOKENS?: string | undefined;
   readonly AGENT_SECRET_KEY_ARN?: string | undefined;
 
   /**
@@ -809,6 +837,12 @@ export interface AgentConfig {
    * Defaults to 3000.
    */
   readonly HEALTH_PORT: number;
+
+  /**
+   * Comma-separated allowlist of exact origins the health server's CORS
+   * preflight handling accepts. Optional — unset means no CORS (#966).
+   */
+  readonly CORS_ALLOWED_ORIGINS?: string | undefined;
 
   /** LLM request budget in tokens. Defaults to 8,000. */
   readonly LLM_MAX_TOKENS_PER_REQUEST: number;

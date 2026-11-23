@@ -12,7 +12,7 @@
  *   - Request bodies are limited to MCP_MAX_BODY_BYTES (default 1 MiB).
  */
 
-import { PayFiAgent, VALUE_MOVING_TASK_TYPES } from '../agent';
+import { PayFiAgent } from '../agent';
 import { config } from '../config';
 import { createLogger } from '../utils/logger';
 import { createHash, timingSafeEqual } from 'crypto';
@@ -98,10 +98,7 @@ function toolToMCPSchema(tool: MCPTool): object {
 /**
  * Handle MCP request and return response.
  */
-export async function handleRequest(
-  agent: PayFiAgent,
-  request: MCPRequest
-): Promise<MCPResponse> {
+export async function handleRequest(agent: PayFiAgent, request: MCPRequest): Promise<MCPResponse> {
   const { id } = request;
 
   try {

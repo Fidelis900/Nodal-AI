@@ -267,6 +267,30 @@ function assertAmountWithinLimits(stroops: bigint): void {
  * Guard the `payTo` address against PAYMENT_DESTINATION_POLICY.
  * Mirrors the same logic used by StellarPaymentTool / agent.ts.
  */
+/**
+ * Convert a PaymentRequirements amount to stroops. In x402 v2 `amount` is in
+ * the token's smallest unit; the payable assets are Stellar Asset Contracts
+ * wrapping classic assets, which always use 7 decimals, so one atomic unit is
+ * exactly one stroop (0.01 USDC is "100000").
+ */
+function atomicAmountToStroops(amount: string): bigint {
+  if (!/^\d+$/.test(amount)) throw new Error(`x402 v2: invalid payment amount "${amount}"`);
+  return BigInt(amount);
+}
+
+/**
+ * Refuses a resource URL whose hostname is not in `ALLOWED_X402_ORIGINS`.
+ * Unset (default) means any origin is allowed.
+ */
+function assertOriginAllowed(url: URL): void {
+  if (!config.ALLOWED_X402_ORIGINS) return;
+
+  const allowedOrigins = new Set(config.ALLOWED_X402_ORIGINS.split(',').map((o) => o.trim()));
+  if (!allowedOrigins.has(url.hostname)) {
+    throw new Error(`x402 v2: untrusted resource origin: ${url.hostname}`);
+  }
+}
+
 function assertPayToAllowed(payTo: string, selfAddress: string): void {
   if (payTo === selfAddress) {
     throw new Error("x402 v2: payTo cannot be the agent's own address");
