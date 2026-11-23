@@ -2,8 +2,8 @@
  * backend/db/storage.ts
  *
  * Storage — the backend-agnostic contract for everything the agent persists
- * (#822): agent results, the audit log, agent state, the spending window and
- * x402 nonces.
+ * (#822, #957, #959): agent results, the audit log, agent state, the spending window,
+ * approvals, idempotency, triggers, and x402 nonces.
  *
  * Two implementations:
  *   • SqliteStorage   — the default; a local file, single instance only.
@@ -15,18 +15,23 @@
  * better-sqlite3 itself is synchronous.
  */
 
+import type { AgentResult } from '../agent';
 import { config } from '../config';
 import type { INonceStore } from '../nonce_store';
 import { SqliteNonceStore } from '../nonce_store';
-import * as persistence from '../persistence';
 import type {
+  ApprovalAuditRow,
   AuditEntry,
   AuditRow,
+  PendingApproval,
   PersistedResult,
   SpendingRecord,
   SpendingReservation,
+  TrackedSpendingRecord,
 } from '../persistence';
+import type { Trigger } from '../triggers';
 import { migrateSqlite } from './migrate';
+import * as sqlite from './sqlite';
 
 export type StorageBackend = 'sqlite' | 'postgres';
 
@@ -59,22 +64,56 @@ export interface Storage {
   loadSpendingRecords(sinceMs: number): Promise<SpendingRecord[]>;
   pruneSpendingRecords(cutoffMs: number): Promise<void>;
   clearSpendingRecords(): Promise<void>;
+
   /**
-   * Atomically check the window total (records at or after `sinceMs`) and
-   * record `amount` against it. Concurrent callers — including other
-   * instances sharing the same database — are serialised, so they can never
-   * jointly exceed `limit`.
-   *
-   * @throws when `amount` would push the total past `limit`.
+   * Per-asset atomic reservation (#959) or legacy float-amount reservation.
+   * Atomically checks window total and records the reservation against it.
    */
+  reserveSpending(options: ReserveSpendingOptions): Promise<SpendingReservation>;
   reserveSpending(
     amount: number,
     limit: number,
     sinceMs: number,
     now?: number
   ): Promise<SpendingReservation>;
+  reserveSpending(
+    optsOrAmount: ReserveSpendingOptions | number,
+    limit?: number,
+    sinceMs?: number,
+    now?: number
+  ): Promise<SpendingReservation>;
+
   /** Release a reservation, e.g. after a failed submission. */
   releaseSpending(id: number): Promise<void>;
+
+  /** Tracked spending records per-asset (#733, #957). */
+  saveTrackedSpendingRecord(record: TrackedSpendingRecord & { assetKey: string }): Promise<void>;
+  getSpendingRecordsSince(sinceMs: number): Promise<TrackedSpendingRecord[]>;
+  deleteTrackedSpendingRecord(reservationId: string): Promise<void>;
+
+  /** Pending approvals (#736, #957). */
+  savePendingApproval(approval: Omit<PendingApproval, 'status' | 'decidedAt'>): Promise<void>;
+  getPendingApproval(id: string): Promise<PendingApproval | undefined>;
+  listPendingApprovals(): Promise<PendingApproval[]>;
+  decideApproval(id: string, decision: 'approved' | 'denied', now?: number): Promise<boolean>;
+  expirePendingApprovals(now?: number): Promise<string[]>;
+  getApprovalAuditLog(): Promise<ApprovalAuditRow[]>;
+
+  /** Idempotency keys (#957). */
+  getIdempotencyResult(key: string, payload: unknown): Promise<AgentResult | { conflict: true } | null>;
+  saveIdempotencyResult(
+    key: string,
+    taskType: string,
+    payload: unknown,
+    result: AgentResult
+  ): Promise<void>;
+  pruneIdempotencyKeys(now?: number): Promise<number>;
+
+  /** Triggers (#957). */
+  saveTrigger(trigger: Trigger): Promise<void>;
+  loadTriggers(): Promise<Trigger[]>;
+  recordTriggerFired(triggerId: string, eventId: string): Promise<boolean>;
+  deleteTrigger(id: string): Promise<void>;
 
   /** Nonce store sharing this storage's database. */
   nonceStore(): INonceStore;
@@ -95,87 +134,167 @@ export interface Storage {
 // ─── SQLite ───────────────────────────────────────────────────────────────────
 
 /**
- * SQLite storage over the connection owned by backend/persistence.ts, so it
- * reads and writes exactly what the rest of the process does.
+ * SQLite storage over the connection owned by backend/db/sqlite.ts.
  */
 export class SqliteStorage implements Storage {
   readonly backend = 'sqlite' as const;
 
   async migrate(): Promise<number> {
-    return migrateSqlite(persistence.getDb()).length;
+    return migrateSqlite(sqlite.getDb()).length;
   }
 
   async probe(): Promise<void> {
-    persistence.probeDb();
+    sqlite.probeDb();
   }
 
   async close(): Promise<void> {
-    persistence.closeDb();
+    sqlite.closeDb();
   }
 
   async saveResult(result: PersistedResult): Promise<void> {
-    persistence.saveResult(result);
+    sqlite.saveResult(result);
   }
 
   async getResults(limit?: number, offset?: number): Promise<PersistedResult[]> {
-    return persistence.getResults(limit, offset);
+    return sqlite.getResults(limit, offset);
   }
 
   async appendAuditEntry(entry: AuditEntry): Promise<AuditRow> {
-    return persistence.appendAuditEntry(entry);
+    return sqlite.appendAuditEntry(entry);
   }
 
   async getAuditLog(): Promise<AuditRow[]> {
-    return persistence.getAuditLog();
+    return sqlite.getAuditLog();
   }
 
   async saveAgentState(key: string, value: string): Promise<void> {
-    persistence.saveAgentState(key, value);
+    sqlite.saveAgentState(key, value);
   }
 
   async loadAgentState(key: string): Promise<string | undefined> {
-    return persistence.loadAgentState(key);
+    return sqlite.loadAgentState(key);
   }
 
   async saveSpendingRecord(record: SpendingRecord): Promise<void> {
-    persistence.saveSpendingRecord(record);
+    sqlite.saveSpendingRecord(record);
   }
 
   async loadSpendingRecords(sinceMs: number): Promise<SpendingRecord[]> {
-    return persistence.loadSpendingRecords(sinceMs);
+    return sqlite.loadSpendingRecords(sinceMs);
   }
 
   async pruneSpendingRecords(cutoffMs: number): Promise<void> {
-    persistence.pruneSpendingRecords(cutoffMs);
+    sqlite.pruneSpendingRecords(cutoffMs);
   }
 
   async clearSpendingRecords(): Promise<void> {
-    persistence.clearSpendingRecords();
+    sqlite.clearSpendingRecords();
   }
 
   async reserveSpending(
-    amount: number,
-    limit: number,
-    sinceMs: number,
+    optsOrAmount: ReserveSpendingOptions | number,
+    limit?: number,
+    sinceMs?: number,
     now?: number
   ): Promise<SpendingReservation> {
-    return persistence.reserveSpendingRecord(amount, limit, sinceMs, now);
+    return sqlite.reserveSpendingRecord(optsOrAmount, limit, sinceMs, now);
   }
 
   async releaseSpending(id: number): Promise<void> {
-    persistence.deleteSpendingRecord(id);
+    sqlite.deleteSpendingRecord(id);
+  }
+
+  async saveTrackedSpendingRecord(
+    record: TrackedSpendingRecord & { assetKey: string }
+  ): Promise<void> {
+    sqlite.saveTrackedSpendingRecord(record);
+  }
+
+  async getSpendingRecordsSince(sinceMs: number): Promise<TrackedSpendingRecord[]> {
+    return sqlite.getSpendingRecordsSince(sinceMs);
+  }
+
+  async deleteTrackedSpendingRecord(reservationId: string): Promise<void> {
+    sqlite.deleteTrackedSpendingRecord(reservationId);
+  }
+
+  async savePendingApproval(
+    approval: Omit<PendingApproval, 'status' | 'decidedAt'>
+  ): Promise<void> {
+    sqlite.savePendingApproval(approval);
+  }
+
+  async getPendingApproval(id: string): Promise<PendingApproval | undefined> {
+    return sqlite.getPendingApproval(id);
+  }
+
+  async listPendingApprovals(): Promise<PendingApproval[]>;
+  async listPendingApprovals(): Promise<PendingApproval[]> {
+    return sqlite.listPendingApprovals();
+  }
+
+  async decideApproval(
+    id: string,
+    decision: 'approved' | 'denied',
+    now?: number
+  ): Promise<boolean> {
+    return sqlite.decideApproval(id, decision, now);
+  }
+
+  async expirePendingApprovals(now?: number): Promise<string[]> {
+    return sqlite.expirePendingApprovals(now);
+  }
+
+  async getApprovalAuditLog(): Promise<ApprovalAuditRow[]> {
+    return sqlite.getApprovalAuditLog();
+  }
+
+  async getIdempotencyResult(
+    key: string,
+    payload: unknown
+  ): Promise<AgentResult | { conflict: true } | null> {
+    return sqlite.getIdempotencyResult(key, payload);
+  }
+
+  async saveIdempotencyResult(
+    key: string,
+    taskType: string,
+    payload: unknown,
+    result: AgentResult
+  ): Promise<void> {
+    sqlite.saveIdempotencyResult(key, taskType, payload, result);
+  }
+
+  async pruneIdempotencyKeys(now?: number): Promise<number> {
+    return sqlite.pruneIdempotencyKeys(now);
+  }
+
+  async saveTrigger(trigger: Trigger): Promise<void> {
+    sqlite.saveTrigger(trigger);
+  }
+
+  async loadTriggers(): Promise<Trigger[]> {
+    return sqlite.loadTriggers();
+  }
+
+  async recordTriggerFired(triggerId: string, eventId: string): Promise<boolean> {
+    return sqlite.recordTriggerFired(triggerId, eventId);
+  }
+
+  async deleteTrigger(id: string): Promise<void> {
+    sqlite.deleteTrigger(id);
   }
 
   nonceStore(): INonceStore {
-    return new SqliteNonceStore(persistence.getDb());
+    return new SqliteNonceStore(sqlite.getDb());
   }
 
   async saveMppSession(channelId: string, state: string): Promise<void> {
-    persistence.saveAgentState(`mpp_session:${channelId}`, state);
+    sqlite.saveAgentState(`mpp_session:${channelId}`, state);
   }
 
   async loadMppSession(channelId: string): Promise<string | undefined> {
-    return persistence.loadAgentState(`mpp_session:${channelId}`);
+    return sqlite.loadAgentState(`mpp_session:${channelId}`);
   }
 
   async listMppSessions(): Promise<MppSessionRecord[]> {
@@ -186,19 +305,19 @@ export class SqliteStorage implements Storage {
   }
 
   async saveX402RateRecord(timestamp: number): Promise<void> {
-    persistence.saveX402RateRecord(timestamp);
+    sqlite.saveX402RateRecord(timestamp);
   }
 
   async loadX402RateRecords(sinceMs: number): Promise<number[]> {
-    return persistence.loadX402RateRecords(sinceMs);
+    return sqlite.loadX402RateRecords(sinceMs);
   }
 
   async pruneX402RateRecords(cutoffMs: number): Promise<void> {
-    persistence.pruneX402RateRecords(cutoffMs);
+    sqlite.pruneX402RateRecords(cutoffMs);
   }
 
   async clearX402RateRecords(): Promise<void> {
-    persistence.clearX402RateRecords();
+    sqlite.clearX402RateRecords();
   }
 }
 

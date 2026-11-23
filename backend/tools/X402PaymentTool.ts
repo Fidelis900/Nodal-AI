@@ -13,12 +13,11 @@ import { Caip2NetworkId, fromCaip2, toCaip2, withBackoffGuard } from '../network
 import { StellarPaymentTool } from './StellarPaymentTool';
 import { buildMemo } from './MemoAttachmentTool';
 import { logger } from '../utils/logger';
-import { INonceStore, SqliteNonceStore, MAX_NONCE_TTL_MS } from '../nonce_store';
+import { INonceStore, MAX_NONCE_TTL_MS } from '../nonce_store';
 import { getStorage } from '../db/storage';
 import { TransactionFailureError } from '../errors';
 import { stellarPublicKeySchema } from '../utils/stellarSchemas';
 import { x402RateLimiter } from '../x402_rate_limiter';
-import { getDb } from '../persistence';
 
 /**
  * Best-effort recovery of a transaction hash from a submission error.
@@ -149,11 +148,7 @@ export class X402PaymentTool {
     this.signer = signer;
     this.paymentTool = new StellarPaymentTool(signer);
     this.horizonServer = horizonServer;
-    this.nonceStore =
-      nonceStore ??
-      (config.STORAGE_BACKEND === 'postgres'
-        ? getStorage().nonceStore()
-        : new SqliteNonceStore(getDb()));
+    this.nonceStore = nonceStore ?? getStorage().nonceStore();
   }
 
   /**
