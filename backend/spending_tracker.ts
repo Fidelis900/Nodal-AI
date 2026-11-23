@@ -65,6 +65,7 @@
  */
 
 import { randomUUID } from 'crypto';
+import { Asset, Networks } from '@stellar/stellar-sdk';
 import { config, MAINNET_SPENDING_CAP } from './config';
 import { logger } from './utils/logger';
 import { spendingAlerts } from './alerts';
@@ -110,6 +111,44 @@ export function assetKey(assetCode: string, assetIssuer?: string): string {
 /** The asset charged when a caller does not name one: the x402 settlement asset. */
 function defaultAssetKey(): string {
   return assetKey(config.X402_ASSET_CODE, config.X402_ASSET_ISSUER);
+}
+
+/**
+ * Map the asset a payment names — a SAC contract address (C…), "XLM", or a
+ * "CODE:ISSUER" pair — back to the canonical key {@link assetKey} produces, so
+ * per-asset SPENDING_LIMITS apply to the asset actually paid.
+ *
+ * The default x402 asset and every `X402_ALLOWED_ASSETS` entry are recognised;
+ * anything else is keyed by the identifier itself, which
+ * SPENDING_LIMITS_ALLOW_UNKNOWN then governs.
+ */
+export function assetKeyForPaymentAsset(asset: string): string {
+  if (asset === config.X402_ASSET_CONTRACT) {
+    return assetKey(config.X402_ASSET_CODE, config.X402_ASSET_ISSUER);
+  }
+  if (asset.toUpperCase() === 'XLM') return 'XLM';
+  if (asset.includes(':')) {
+    const [code, issuer] = asset.split(':');
+    return assetKey(code!, issuer);
+  }
+
+  const networkPassphrase = {
+    testnet: Networks.TESTNET,
+    mainnet: Networks.PUBLIC,
+    futurenet: Networks.FUTURENET,
+  }[config.STELLAR_NETWORK];
+
+  if (config.X402_ALLOWED_ASSETS) {
+    for (const entry of config.X402_ALLOWED_ASSETS.split(',').map((s) => s.trim())) {
+      const [code, issuer] = entry.split(':');
+      const sac = entry === 'XLM' ? Asset.native() : new Asset(code!, issuer);
+      if (sac.contractId(networkPassphrase) === asset) {
+        return entry === 'XLM' ? 'XLM' : assetKey(code!, issuer);
+      }
+    }
+  }
+
+  return asset;
 }
 
 /** True when SPENDING_LIMITS configures per-asset limits (#733). */

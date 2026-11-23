@@ -100,6 +100,13 @@ pub enum DataKey {
     PendingArbiterTime,
     FeeBps,
     FeeRecipient,
+    /// Cumulative amount paid out to the recipient (net + fee) across all
+    /// release calls so far, used to charge the fee on the running total
+    /// rather than per-call (#988).
+    TotalReleased,
+    /// Cumulative platform fee charged so far, used alongside
+    /// `TotalReleased` to compute only the incremental fee owed on each call.
+    FeePaid,
 }
 
 // ─── Escrow State ─────────────────────────────────────────────────────────────
@@ -903,12 +910,39 @@ impl EscrowContract {
 
     /// Transfer `amount` out of the escrow to `recipient`, splitting off the
     /// configured platform fee. Guarantees `net + fee == amount`.
+    ///
+    /// The fee is charged on the *cumulative* amount released from this
+    /// escrow so far (`TotalReleased`), not on `amount` in isolation: this
+    /// call's fee is `floor(total_released * fee_bps / 10_000) -
+    /// fee_paid_so_far`. Without this, an arbiter could split a release into
+    /// many tranches small enough that each one's own fee floors to zero,
+    /// avoiding the fee entirely (#988). Tracking the running total makes the
+    /// fee on the sum of any split equal the fee on the total.
     fn pay_recipient(env: &Env, token: &Address, recipient: &Address, amount: i128) {
         let fee_bps: u32 = env.storage().instance().get(&DataKey::FeeBps).unwrap_or(0);
         let fee_recipient: Option<Address> = env.storage().instance().get(&DataKey::FeeRecipient);
 
         let fee = match fee_recipient {
-            Some(_) => Self::compute_fee(amount, fee_bps),
+            Some(_) => {
+                let total_released_before: i128 = env
+                    .storage()
+                    .instance()
+                    .get(&DataKey::TotalReleased)
+                    .unwrap_or(0);
+                let fee_paid_before: i128 =
+                    env.storage().instance().get(&DataKey::FeePaid).unwrap_or(0);
+                let total_released_after = total_released_before + amount;
+                let fee = Self::compute_fee(total_released_after, fee_bps) - fee_paid_before;
+
+                env.storage()
+                    .instance()
+                    .set(&DataKey::TotalReleased, &total_released_after);
+                env.storage()
+                    .instance()
+                    .set(&DataKey::FeePaid, &(fee_paid_before + fee));
+
+                fee
+            }
             None => 0,
         };
         let net = amount - fee;

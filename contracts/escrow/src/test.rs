@@ -1287,6 +1287,73 @@ mod tests {
         });
     }
 
+    /// Strategy: `(amount, cuts, fee_bps)` — a `partial_release_strategy()`
+    /// pair plus a fee in `0..=MAX_FEE_BPS`.
+    fn partial_release_with_fee_strategy() -> impl Strategy<Value = (i128, Vec<i128>, u32)> {
+        (partial_release_strategy(), 0..=crate::MAX_FEE_BPS)
+            .prop_map(|((amount, cuts), fee_bps)| (amount, cuts, fee_bps))
+    }
+
+    // 39b. property: splitting a release into many tranches charges the same
+    // total fee as releasing it all at once (#988) — the bug this fixes was
+    // that `compute_fee` was applied per call, so any tranche below
+    // `10_000 / fee_bps` stroops floored to a zero fee, letting the fee be
+    // avoided entirely by splitting finely enough.
+    #[test]
+    fn prop_split_fee_equals_fee_on_total() {
+        proptest!(ProptestConfig::with_cases(128), |((amount, cuts, fee_bps) in partial_release_with_fee_strategy())| {
+            let env = Env::default();
+            env.mock_all_auths();
+            let depositor = Address::generate(&env);
+            let recipient = Address::generate(&env);
+            let arbiter = Address::generate(&env);
+            let fee_recipient = Address::generate(&env);
+            let (token_id, token) = create_token(&env, &depositor);
+            StellarAssetClient::new(&env, &token_id).mint(&depositor, &amount);
+            let contract_id = env.register_contract(None, EscrowContract);
+            let client = EscrowContractClient::new(&env, &contract_id);
+            client.initialize_with_fee(
+                &depositor,
+                &recipient,
+                &arbiter,
+                &token_id,
+                &amount,
+                &(env.ledger().timestamp() + EXPIRY_OFFSET),
+                &fee_bps,
+                &fee_recipient,
+            );
+
+            let mut points = cuts;
+            points.sort_unstable();
+            points.dedup();
+            let mut boundaries = vec![0];
+            boundaries.extend(points);
+            boundaries.push(amount);
+            let parts: Vec<i128> = boundaries.windows(2).map(|w| w[1] - w[0]).collect();
+
+            for part in parts {
+                client.release_partial(&arbiter, &part);
+            }
+
+            let expected_total_fee = EscrowContract::compute_fee(amount, fee_bps);
+            prop_assert_eq!(
+                token.balance(&fee_recipient),
+                expected_total_fee,
+                "fee charged over any split must equal the fee on the full amount"
+            );
+            prop_assert_eq!(
+                token.balance(&recipient),
+                amount - expected_total_fee,
+                "recipient must receive the amount net of the total fee, regardless of split"
+            );
+            prop_assert_eq!(
+                token.balance(&contract_id),
+                0,
+                "no funds may remain stuck in the contract"
+            );
+        });
+    }
+
     // 40. property: a post-expiry refund returns exactly the initialised amount
     #[test]
     fn prop_refund_conserves_funds() {
