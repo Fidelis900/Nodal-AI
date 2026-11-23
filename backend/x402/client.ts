@@ -180,6 +180,53 @@ function allowedAssetContracts(): Set<string> {
 }
 
 /**
+ * Convert a PaymentRequirements amount to stroops. In x402 v2 `amount` is in
+ * the token's smallest unit; the payable assets are Stellar Asset Contracts
+ * wrapping classic assets, which always use 7 decimals, so one atomic unit is
+ * exactly one stroop (0.01 USDC is "100000").
+ */
+function atomicAmountToStroops(amount: string): bigint {
+  if (!/^\d+$/.test(amount)) throw new Error(`x402 v2: invalid payment amount "${amount}"`);
+  return BigInt(amount);
+}
+
+/**
+ * Map the SAC contract address a requirement pays in (`req.asset`) back to the
+ * spending tracker's canonical asset key (`CODE:ISSUER` or `XLM`), so per-asset
+ * SPENDING_LIMITS apply to the asset actually paid. The default x402 asset and
+ * every `X402_ALLOWED_ASSETS` entry are recognised; anything else is keyed by
+ * the contract address itself, which SPENDING_LIMITS_ALLOW_UNKNOWN then governs.
+ */
+function assetKeyForRequirement(asset: string): string {
+  if (asset === config.X402_ASSET_CONTRACT) {
+    return assetKey(config.X402_ASSET_CODE, config.X402_ASSET_ISSUER);
+  }
+  if (asset.toUpperCase() === 'XLM') return 'XLM';
+  if (asset.includes(':')) {
+    const [code, issuer] = asset.split(':');
+    return assetKey(code!, issuer);
+  }
+
+  const networkPassphrase = {
+    testnet: Networks.TESTNET,
+    mainnet: Networks.PUBLIC,
+    futurenet: Networks.FUTURENET,
+  }[config.STELLAR_NETWORK];
+
+  if (config.X402_ALLOWED_ASSETS) {
+    for (const entry of config.X402_ALLOWED_ASSETS.split(',').map((s) => s.trim())) {
+      const [code, issuer] = entry.split(':');
+      const sac = entry === 'XLM' ? Asset.native() : new Asset(code!, issuer);
+      if (sac.contractId(networkPassphrase) === asset) {
+        return entry === 'XLM' ? 'XLM' : assetKey(code!, issuer);
+      }
+    }
+  }
+
+  return asset;
+}
+
+/**
  * Guard the amount from a PaymentRequirements against AGENT_SPENDING_LIMIT and
  * the mainnet hard cap. Throws with a clear message if either is exceeded.
  */

@@ -102,6 +102,7 @@ vi.mock('../backend/config', () => {
     SPENDING_LIMITS_MAP: new Map<string, string>(),
     SPENDING_LIMITS_ALLOW_UNKNOWN: false,
     NANO_RPC_URL: 'http://127.0.0.1:7076',
+    NANO_ENABLED: false,
   };
 
   return {
