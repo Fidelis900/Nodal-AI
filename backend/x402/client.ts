@@ -47,7 +47,7 @@
  * filtered out before the selector runs.
  */
 
-import { Asset, Networks, xdr } from '@stellar/stellar-sdk';
+import { Asset, xdr } from '@stellar/stellar-sdk';
 
 // Shared HTTP fetch helper with configurable timeout.
 export interface HttpFetchOptions {
@@ -84,7 +84,7 @@ import { config, MAINNET_SPENDING_CAP } from '../config';
 import { createLogger } from '../utils/logger';
 import { fromStroops, toStroops, tryToStroops } from '../utils/amount';
 import { toCaip2 } from '../network';
-import { assetKey, spendingTracker } from '../spending_tracker';
+import { assetKeyForPaymentAsset, spendingTracker } from '../spending_tracker';
 import { PolicyViolationError } from '../errors';
 import type { Signer } from '../signer';
 import { resolveNetworkPassphrase, sorobanServer } from '../rpc_client';
@@ -469,7 +469,7 @@ export class X402FetchClient {
     // ── 5. Reserve spend ─────────────────────────────────────────────────────
     const reservationId = spendingTracker.reserve(
       chosen.amount,
-      assetKeyForRequirement(chosen.asset)
+      assetKeyForPaymentAsset(chosen.asset)
     );
 
     let paymentPayload;
