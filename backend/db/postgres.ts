@@ -2,7 +2,7 @@
  * backend/db/postgres.ts
  *
  * Postgres implementation of {@link Storage} for multi-instance deployments
- * (#822, #958). Every instance pointed at the same DATABASE_URL shares one spending
+ * (#822, #957, #959). Every instance pointed at the same DATABASE_URL shares one spending
  * window, one nonce set, one audit chain, approvals, triggers and idempotency.
  *
  * Concurrency:
@@ -14,7 +14,7 @@
  *   • Migrations run under a session advisory lock (see migrate.ts).
  */
 
-import { createHash } from 'crypto';
+import { createHash, randomUUID } from 'crypto';
 import { Pool } from 'pg';
 import type { PoolClient } from 'pg';
 import type { AgentResult } from '../agent';
@@ -28,6 +28,7 @@ import type {
   PersistedResult,
   SpendingRecord,
   SpendingReservation,
+  TrackedSpendingRecord,
 } from '../persistence';
 import { AUDIT_GENESIS_HASH, computeAuditHash } from '../persistence';
 import type { Trigger, TriggerSource } from '../triggers';
@@ -100,8 +101,8 @@ export class PostgresStorage implements Storage {
 
   async saveResult(result: PersistedResult): Promise<void> {
     await this.pool.query(
-      `INSERT INTO agent_results ("timestamp", "taskType", success, data, error, "correlationId")
-       VALUES ($1, $2, $3, $4, $5, $6)`,
+      `INSERT INTO agent_results ("timestamp", "taskType", success, data, error, "correlationId", "errorType", "durationMs")
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
       [
         result.timestamp,
         result.taskType,
@@ -109,13 +110,15 @@ export class PostgresStorage implements Storage {
         result.data !== undefined ? JSON.stringify(result.data) : null,
         result.error ?? null,
         result.correlationId ?? null,
+        result.errorType ?? null,
+        result.durationMs ?? null,
       ]
     );
   }
 
   async getResults(limit = 100, offset = 0): Promise<PersistedResult[]> {
     const { rows } = await this.pool.query(
-      `SELECT "timestamp", "taskType", success, data, error, "correlationId"
+      `SELECT "timestamp", "taskType", success, data, error, "correlationId", "errorType", "durationMs"
        FROM agent_results
        ORDER BY "timestamp" DESC, id DESC
        LIMIT $1 OFFSET $2`,
@@ -128,6 +131,8 @@ export class PostgresStorage implements Storage {
       data: r.data !== null ? JSON.parse(r.data) : undefined,
       error: r.error ?? undefined,
       correlationId: r.correlationId ?? undefined,
+      errorType: r.errorType ?? undefined,
+      durationMs: r.durationMs ?? undefined,
     }));
   }
 
@@ -233,32 +238,117 @@ export class PostgresStorage implements Storage {
   }
 
   async reserveSpending(
-    amount: number,
-    limit: number,
-    sinceMs: number,
-    now: number = Date.now()
+    optsOrAmount: ReserveSpendingOptions | number,
+    limit?: number,
+    sinceMs?: number,
+    now?: number
   ): Promise<SpendingReservation> {
+    const opts: ReserveSpendingOptions =
+      typeof optsOrAmount === 'object'
+        ? optsOrAmount
+        : {
+            assetKey: 'USDC',
+            amountStroops: BigInt(Math.round(optsOrAmount * 10_000_000)),
+            limitStroops: BigInt(Math.round((limit ?? 0) * 10_000_000)),
+            sinceMs: sinceMs ?? 0,
+            now: now ?? Date.now(),
+          };
+
     return withTransaction(this.pool, async (client) => {
+      // Row lock: serialises concurrent reservations across instances
       await client.query(`SELECT id FROM spending_lock WHERE id = 1 FOR UPDATE`);
-      const sum = await client.query(
-        `SELECT COALESCE(SUM(amount), 0) AS total FROM spending_records
+
+      const res = await client.query(
+        `SELECT stroops, amount, asset_key FROM spending_records
          WHERE "timestamp" >= $1`,
-        [sinceMs]
+        [opts.sinceMs]
       );
-      const total = Number(sum.rows[0].total) + amount;
-      if (total > limit) {
-        throw new Error(`Cumulative spending ${total} exceeds limit ${limit}`);
+
+      let currentTotalStroops = 0n;
+      for (const row of res.rows) {
+        const rowAsset = row.asset_key ?? 'USDC';
+        if (rowAsset === opts.assetKey) {
+          if (row.stroops != null) {
+            currentTotalStroops += BigInt(row.stroops);
+          } else {
+            currentTotalStroops += BigInt(Math.round(Number(row.amount) * 10_000_000));
+          }
+        }
       }
+
+      const totalStroops = currentTotalStroops + opts.amountStroops;
+      if (totalStroops > opts.limitStroops) {
+        throw new Error(
+          `Cumulative spending ${Number(totalStroops) / 10_000_000} exceeds limit ${
+            Number(opts.limitStroops) / 10_000_000
+          }`
+        );
+      }
+
+      const resId = randomUUID();
+      const timestamp = opts.now ?? Date.now();
       const inserted = await client.query(
-        `INSERT INTO spending_records (amount, "timestamp") VALUES ($1, $2) RETURNING id`,
-        [amount, now]
+        `INSERT INTO spending_records (amount, "timestamp", reservation_id, asset_key, stroops)
+         VALUES ($1, $2, $3, $4, $5) RETURNING id`,
+        [
+          Number(opts.amountStroops) / 10_000_000,
+          timestamp,
+          resId,
+          opts.assetKey,
+          opts.amountStroops.toString(),
+        ]
       );
-      return { id: Number(inserted.rows[0].id), total };
+
+      return {
+        id: Number(inserted.rows[0].id),
+        total: Number(totalStroops) / 10_000_000,
+        totalStroops,
+      };
     });
   }
 
   async releaseSpending(id: number): Promise<void> {
     await this.pool.query(`DELETE FROM spending_records WHERE id = $1`, [id]);
+  }
+
+  async saveTrackedSpendingRecord(
+    record: TrackedSpendingRecord & { assetKey: string }
+  ): Promise<void> {
+    await this.pool.query(
+      `INSERT INTO spending_records (amount, "timestamp", reservation_id, asset_key, stroops)
+       VALUES ($1, $2, $3, $4, $5)`,
+      [
+        Number(record.stroops) / 10_000_000,
+        record.timestamp,
+        record.id,
+        record.assetKey,
+        record.stroops.toString(),
+      ]
+    );
+  }
+
+  async getSpendingRecordsSince(sinceMs: number): Promise<TrackedSpendingRecord[]> {
+    const { rows } = await this.pool.query(
+      `SELECT id, amount, "timestamp", reservation_id, asset_key, stroops
+       FROM spending_records
+       WHERE "timestamp" >= $1
+       ORDER BY "timestamp" ASC`,
+      [sinceMs]
+    );
+
+    return rows.map((r: any) => ({
+      id: r.reservation_id ?? `legacy-${r.id}`,
+      assetKey: r.asset_key,
+      stroops:
+        r.stroops !== null ? BigInt(r.stroops) : BigInt(Math.round(Number(r.amount) * 10_000_000)),
+      timestamp: Number(r.timestamp),
+    }));
+  }
+
+  async deleteTrackedSpendingRecord(reservationId: string): Promise<void> {
+    await this.pool.query(`DELETE FROM spending_records WHERE reservation_id = $1`, [
+      reservationId,
+    ]);
   }
 
   // ─── Approvals ──────────────────────────────────────────────────────────────
@@ -492,16 +582,6 @@ export class PostgresStorage implements Storage {
 
   async deleteTrigger(id: string): Promise<void> {
     await this.pool.query(`DELETE FROM triggers WHERE id = $1`, [id]);
-  }
-
-  // ─── Kill switch state ──────────────────────────────────────────────────────
-
-  async setPaused(paused: boolean): Promise<void> {
-    await this.saveAgentState('paused', String(paused));
-  }
-
-  async isPaused(): Promise<boolean> {
-    return (await this.loadAgentState('paused')) === 'true';
   }
 
   // ─── Nonces ─────────────────────────────────────────────────────────────────

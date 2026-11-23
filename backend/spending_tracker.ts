@@ -76,7 +76,8 @@ import {
   pruneSpendingRecords,
   saveTrackedSpendingRecord,
 } from './persistence';
-import { toStroops, tryToStroops, stroopsToString, STROOPS_PER_UNIT } from './utils/amount';
+import { getStorage } from './db/storage';
+import { toStroops, stroopsToString, STROOPS_PER_UNIT } from './utils/amount';
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -535,12 +536,21 @@ export class SpendingTracker {
 
   private persist(entry: SpendingEntry): void {
     try {
-      saveTrackedSpendingRecord({
-        id: entry.id,
-        assetKey: entry.assetKey,
-        stroops: entry.stroops,
-        timestamp: entry.timestampMs,
-      });
+      if (config.STORAGE_BACKEND === 'postgres') {
+        void getStorage().saveTrackedSpendingRecord({
+          id: entry.id,
+          assetKey: entry.assetKey,
+          stroops: entry.stroops,
+          timestamp: entry.timestampMs,
+        });
+      } else {
+        saveTrackedSpendingRecord({
+          id: entry.id,
+          assetKey: entry.assetKey,
+          stroops: entry.stroops,
+          timestamp: entry.timestampMs,
+        });
+      }
     } catch (err) {
       // A spend that cannot be written down still counts in this process.
       logger.warn({ error: String(err) }, 'Could not persist spending record');
@@ -550,7 +560,11 @@ export class SpendingTracker {
   /** Delete the persisted row for a cancelled spend (#731). */
   private forget(id: string): void {
     try {
-      deleteTrackedSpendingRecord(id);
+      if (config.STORAGE_BACKEND === 'postgres') {
+        void getStorage().deleteTrackedSpendingRecord(id);
+      } else {
+        deleteTrackedSpendingRecord(id);
+      }
     } catch {
       // Persistence is best-effort; the in-memory window is authoritative.
     }
@@ -567,7 +581,11 @@ export class SpendingTracker {
     }
     if (evicted) {
       try {
-        pruneSpendingRecords(cutoff);
+        if (config.STORAGE_BACKEND === 'postgres') {
+          void getStorage().pruneSpendingRecords(cutoff);
+        } else {
+          pruneSpendingRecords(cutoff);
+        }
       } catch {
         // Pruning is housekeeping; failing to do it must not block a payment.
       }
@@ -580,7 +598,11 @@ export class SpendingTracker {
     this.entries = [];
     spendingAlerts.reset();
     try {
-      clearSpendingRecords();
+      if (config.STORAGE_BACKEND === 'postgres') {
+        void getStorage().clearSpendingRecords();
+      } else {
+        clearSpendingRecords();
+      }
     } catch {
       // Nothing persisted to clear.
     }

@@ -8,8 +8,7 @@
 import { PayFiAgent, AgentTask } from './agent';
 import { config } from './config';
 import { createLogger } from './utils/logger';
-import { getDb } from './persistence';
-import { tryToStroops } from './utils/amount';
+import { getStorage } from './db/storage';
 
 const log = createLogger('triggers');
 
@@ -45,63 +44,21 @@ export interface Trigger {
  * Persist trigger to database.
  */
 async function saveTrigger(trigger: Trigger): Promise<void> {
-  getDb()
-    .prepare(
-      `INSERT OR REPLACE INTO triggers (id, source, filter, task, enabled, created_at, last_fired_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?)`
-    )
-    .run(
-      trigger.id,
-      trigger.source,
-      JSON.stringify(trigger.filter),
-      JSON.stringify(trigger.task),
-      trigger.enabled ? 1 : 0,
-      trigger.createdAt,
-      trigger.lastFiredAt ?? null
-    );
+  await getStorage().saveTrigger(trigger);
 }
 
 /**
  * Load all triggers from database.
  */
 async function loadTriggers(): Promise<Trigger[]> {
-  try {
-    const rows = getDb().prepare('SELECT * FROM triggers').all() as Array<{
-      id: string;
-      source: string;
-      filter: string;
-      task: string;
-      enabled: number;
-      created_at: string;
-      last_fired_at: string | null;
-    }>;
-
-    return rows.map((row) => ({
-      id: row.id,
-      source: row.source as TriggerSource,
-      filter: JSON.parse(row.filter),
-      task: JSON.parse(row.task),
-      enabled: row.enabled === 1,
-      createdAt: row.created_at,
-      ...(row.last_fired_at !== null ? { lastFiredAt: row.last_fired_at } : {}),
-    }));
-  } catch {
-    // Table doesn't exist yet
-    return [];
-  }
+  return getStorage().loadTriggers();
 }
 
 /**
  * Record that a trigger fired for an event (dedupe).
  */
 async function recordTriggerFired(triggerId: string, eventId: string): Promise<boolean> {
-  const key = `trigger:${triggerId}:event:${eventId}`;
-  // One atomic statement: of two concurrent deliveries of the same event only
-  // one inserts the row, so a check-then-insert race cannot fire it twice.
-  const info = getDb()
-    .prepare('INSERT OR IGNORE INTO trigger_events (key, fired_at) VALUES (?, ?)')
-    .run(key, new Date().toISOString());
-  return info.changes === 1; // 0 = already fired for this event
+  return getStorage().recordTriggerFired(triggerId, eventId);
 }
 
 /**
@@ -258,7 +215,7 @@ export class TriggerManager {
    */
   async deleteTrigger(id: string): Promise<void> {
     this.triggers.delete(id);
-    getDb().prepare('DELETE FROM triggers WHERE id = ?').run(id);
+    await getStorage().deleteTrigger(id);
     log.info({ triggerId: id }, 'Trigger deleted');
   }
 
