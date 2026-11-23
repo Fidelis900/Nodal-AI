@@ -44,6 +44,32 @@ mod tests {
         (token_id, token)
     }
 
+    // TTL bump check (#805)
+    #[test]
+    fn test_instance_ttl_bump_and_storage_survival() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let depositor = Address::generate(&env);
+        let recipient = Address::generate(&env);
+        let arbiter = Address::generate(&env);
+        let (token_id, _token) = create_token(&env, &depositor);
+        StellarAssetClient::new(&env, &token_id).mint(&depositor, &1_000);
+        let contract_id = env.register_contract(None, EscrowContract);
+        let client = EscrowContractClient::new(&env, &contract_id);
+        let expiry = env.ledger().timestamp() + 10_000;
+        client.initialize(&depositor, &recipient, &arbiter, &token_id, &500, &expiry);
+
+        env.ledger().with_mut(|li| {
+            li.sequence_number += 10_000;
+        });
+
+        client.bump();
+
+        let state = client.get_state();
+        assert_eq!(state.amount, 500);
+        assert_eq!(state.released, false);
+    }
+
     // 1. initialize -> release
     #[test]
     fn test_initialize_and_release() {

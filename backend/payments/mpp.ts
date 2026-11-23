@@ -47,6 +47,7 @@ import { createAgentSigner, Signer } from '../signer';
 import { assetKeyForPaymentAsset, spendingTracker } from '../spending_tracker';
 import { SOROBAN_TX_TIMEOUT } from '../tools/SorobanInvokeTool';
 import { createLogger } from '../utils/logger';
+import { toStroops } from '../utils/amount';
 import { caip2Network } from '../x402/middleware';
 
 const log = createLogger('mpp-charge');

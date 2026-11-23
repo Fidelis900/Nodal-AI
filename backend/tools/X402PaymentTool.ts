@@ -121,7 +121,7 @@ function assertAcceptableChallengeTerms(challenge: X402Challenge): void {
     }
   }
 
-  if (config.X402_MAX_PRICE && parseFloat(challenge.amount) > parseFloat(config.X402_MAX_PRICE)) {
+  if (config.X402_MAX_PRICE && toStroops(challenge.amount) > toStroops(config.X402_MAX_PRICE)) {
     throw new Error(
       `x402: challenge amount ${challenge.amount} exceeds X402_MAX_PRICE of ${config.X402_MAX_PRICE}`
     );

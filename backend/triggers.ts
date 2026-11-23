@@ -77,9 +77,13 @@ function matchesFilter(event: unknown, filter: TriggerFilter): boolean {
   }
 
   if (filter.minAmount) {
-    const eventAmount = parseFloat(String(e.amount ?? e.value ?? '0'));
-    const minAmount = parseFloat(filter.minAmount);
-    if (eventAmount < minAmount) return false;
+    const eventStroops = tryToStroops(String(e.amount ?? e.value ?? '0'));
+    const minStroops = tryToStroops(filter.minAmount);
+    if (eventStroops !== null && minStroops !== null) {
+      if (eventStroops < minStroops) return false;
+    } else {
+      return false;
+    }
   }
 
   if (filter.contractId) {
@@ -144,10 +148,10 @@ export class TriggerManager {
         // Check spending limit before execution
         const p = trigger.task.payload as Record<string, unknown>;
         if (p.amount) {
-          const limit = parseFloat(config.AGENT_SPENDING_LIMIT);
-          const amount = parseFloat(String(p.amount));
-          if (amount > limit) {
-            log.warn({ triggerId: id, amount }, 'Trigger exceeds spending limit');
+          const limitStroops = tryToStroops(config.AGENT_SPENDING_LIMIT);
+          const amountStroops = tryToStroops(String(p.amount));
+          if (amountStroops !== null && limitStroops !== null && amountStroops > limitStroops) {
+            log.warn({ triggerId: id, amount: String(p.amount) }, 'Trigger exceeds spending limit');
             continue;
           }
         }

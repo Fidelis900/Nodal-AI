@@ -441,6 +441,108 @@ describe.each(backends)('Storage ($name)', (backend) => {
       expect(await nonces.has('nonce-2')).toBe(false);
     });
   });
+
+  describe('approvals (#958)', () => {
+    it('saves, retrieves, lists, decides and audits approvals', async () => {
+      const now = Date.now();
+      await storage.savePendingApproval({
+        id: 'app-1',
+        taskType: 'stellar_payment',
+        payload: { amount: '10' },
+        amount: '10',
+        correlationId: 'corr-app',
+        createdAt: now,
+        expiresAt: now + 60_000,
+      });
+
+      const retrieved = await storage.getPendingApproval('app-1');
+      expect(retrieved).toBeDefined();
+      expect(retrieved?.id).toBe('app-1');
+      expect(retrieved?.status).toBe('pending_approval');
+
+      const list = await storage.listPendingApprovals();
+      expect(list.some((a) => a.id === 'app-1')).toBe(true);
+
+      const decided = await storage.decideApproval('app-1', 'approved', now + 1_000);
+      expect(decided).toBe(true);
+
+      const reDecided = await storage.decideApproval('app-1', 'denied', now + 2_000);
+      expect(reDecided).toBe(false);
+
+      const audit = await storage.getApprovalAuditLog();
+      expect(audit.some((row) => row.approvalId === 'app-1' && row.decision === 'approved')).toBe(
+        true
+      );
+    });
+
+    it('expires overdue approvals and audits expiration', async () => {
+      const now = 10_000;
+      await storage.savePendingApproval({
+        id: 'app-expired',
+        taskType: 'stellar_payment',
+        payload: { amount: '5' },
+        amount: '5',
+        correlationId: null,
+        createdAt: now,
+        expiresAt: now + 1_000,
+      });
+
+      const expired = await storage.expirePendingApprovals(now + 2_000);
+      expect(expired).toContain('app-expired');
+
+      const app = await storage.getPendingApproval('app-expired');
+      expect(app?.status).toBe('expired');
+    });
+  });
+
+  describe('idempotency (#958)', () => {
+    it('returns stored result on matching payload and conflict on mismatched payload', async () => {
+      const result: any = { success: true, taskType: 'stellar_payment', data: { tx: 'tx1' } };
+      await storage.saveIdempotencyResult('idem-key-1', 'stellar_payment', { amount: '10' }, result);
+
+      const match = await storage.getIdempotencyResult('idem-key-1', { amount: '10' });
+      expect(match).toEqual(result);
+
+      const conflict = await storage.getIdempotencyResult('idem-key-1', { amount: '20' });
+      expect(conflict).toEqual({ conflict: true });
+    });
+  });
+
+  describe('triggers (#958)', () => {
+    it('saves, loads, dedupes and deletes triggers', async () => {
+      const trigger: any = {
+        id: 'trig-1',
+        source: 'payment',
+        filter: { assetCode: 'USDC' },
+        task: { type: 'stellar_payment', payload: { amount: '1' } },
+        enabled: true,
+        createdAt: new Date().toISOString(),
+      };
+
+      await storage.saveTrigger(trigger);
+      const loaded = await storage.loadTriggers();
+      expect(loaded.some((t) => t.id === 'trig-1')).toBe(true);
+
+      const firstFire = await storage.recordTriggerFired('trig-1', 'event-1');
+      expect(firstFire).toBe(true);
+      const duplicateFire = await storage.recordTriggerFired('trig-1', 'event-1');
+      expect(duplicateFire).toBe(false);
+
+      await storage.deleteTrigger('trig-1');
+      const afterDelete = await storage.loadTriggers();
+      expect(afterDelete.some((t) => t.id === 'trig-1')).toBe(false);
+    });
+  });
+
+  describe('kill-switch state (#958)', () => {
+    it('persists paused state and reports correctly', async () => {
+      expect(await storage.isPaused()).toBe(false);
+      await storage.setPaused(true);
+      expect(await storage.isPaused()).toBe(true);
+      await storage.setPaused(false);
+      expect(await storage.isPaused()).toBe(false);
+    });
+  });
 });
 
 describe('Multi-instance Postgres sharing integration test (#957)', () => {

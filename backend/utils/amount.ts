@@ -196,9 +196,24 @@ export function tryToStroops(decimal: string): bigint | null {
 }
 
 /**
+ * Convert a stroop count or Stellar decimal string to a JavaScript number.
+ * CAUTION: Only for display/metrics/logging. Never use for financial comparisons or calculations (#956).
+ */
+export function amountToNumber(amount: string | bigint): number {
+  const stroops = typeof amount === 'bigint' ? amount : toStroops(amount);
+  return Number(stroops) / Number(STROOP_SCALE);
+}
+
+/**
  * Zod schema for validating a positive Stellar payment amount.
  */
 export const positiveAmountSchema = z
   .string()
   .regex(POSITIVE_STELLAR_AMOUNT_REGEX, 'Amount must be a valid Stellar decimal')
-  .refine((v) => parseFloat(v) > 0, 'Amount must be greater than zero');
+  .refine((v) => {
+    try {
+      return toStroops(v) > 0n;
+    } catch {
+      return false;
+    }
+  }, 'Amount must be greater than zero');

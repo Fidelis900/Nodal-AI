@@ -267,7 +267,7 @@ export class SpendingTracker {
    * @throws if the new cumulative total would exceed the applicable limit.
    */
   record(amountStr: string, assetKeyStr: string = defaultAssetKey()): void {
-    if (isNaN(parseFloat(amountStr))) return; // let callers handle invalid input
+    if (isNaN(Number(amountStr))) return; // let callers handle invalid input
     this.exclusive(() => {
       this.addEntry(amountStr, assetKeyStr, true);
     });
@@ -287,18 +287,15 @@ export class SpendingTracker {
     this.pruneOld(Date.now());
 
     let idx = this.entries.findIndex((e) => e.id === idOrAmount);
-    if (idx === -1 && !isNaN(parseFloat(idOrAmount))) {
-      let stroops: bigint | null = null;
-      try {
-        stroops = toStroops(idOrAmount);
-      } catch {
-        // Not a well-formed amount, so nothing can have been recorded for it.
-      }
-      for (let i = this.entries.length - 1; i >= 0 && stroops !== null; i--) {
-        const e = this.entries[i];
-        if (e && e.committed && e.stroops === stroops) {
-          idx = i;
-          break;
+    if (idx === -1) {
+      const stroops = tryToStroops(idOrAmount);
+      if (stroops !== null) {
+        for (let i = this.entries.length - 1; i >= 0; i--) {
+          const e = this.entries[i];
+          if (e && e.committed && e.stroops === stroops) {
+            idx = i;
+            break;
+          }
         }
       }
     }

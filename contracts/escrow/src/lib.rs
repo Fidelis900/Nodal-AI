@@ -73,6 +73,17 @@ pub const BPS_DENOMINATOR: u32 = 10_000;
 /// most of the locked funds away from the recipient.
 pub const MAX_FEE_BPS: u32 = 1_000;
 
+/// Minimum ledgers of remaining lifetime before instance storage is extended (~1 day at 5s/ledger).
+pub const INSTANCE_TTL_THRESHOLD: u32 = 17_280;
+/// Number of ledgers to extend instance storage lifetime to (~7 days at 5s/ledger).
+pub const INSTANCE_TTL_EXTEND_TO: u32 = 120_960;
+
+fn bump_instance_ttl(env: &Env) {
+    env.storage()
+        .instance()
+        .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND_TO);
+}
+
 // ─── Storage keys ─────────────────────────────────────────────────────────────
 
 #[contracttype]
@@ -340,6 +351,8 @@ impl EscrowContract {
             (Symbol::new(&env, "escrow"), Symbol::new(&env, "released")),
             (recipient, amount),
         );
+
+        bump_instance_ttl(&env);
     }
 
     /// Refund depositor after expiry. Only callable by the stored depositor.
@@ -409,6 +422,8 @@ impl EscrowContract {
 
         env.events()
             .publish((Symbol::new(&env, "refunded"),), (stored_depositor, amount));
+
+        bump_instance_ttl(&env);
     }
 
     /// Return a snapshot of all escrow fields. Panics if not yet initialized.
@@ -554,6 +569,8 @@ impl EscrowContract {
                 (recipient, release_amount, remaining),
             );
         }
+
+        bump_instance_ttl(&env);
     }
 
     /// Cancel the escrow cooperatively. Requires both depositor and arbiter to authorise.
@@ -625,6 +642,8 @@ impl EscrowContract {
             (Symbol::new(&env, "escrow"), Symbol::new(&env, "cancelled")),
             (stored_depositor, amount),
         );
+
+        bump_instance_ttl(&env);
     }
 
     /// Release the remaining funds to the recipient early. Only callable by the
@@ -690,6 +709,8 @@ impl EscrowContract {
             ),
             (stored_depositor, recipient, amount),
         );
+
+        bump_instance_ttl(&env);
     }
 
     /// Voluntarily return the remaining funds to the depositor. Only callable
@@ -758,6 +779,8 @@ impl EscrowContract {
             ),
             (stored_recipient, depositor, amount),
         );
+
+        bump_instance_ttl(&env);
     }
 
     /// Propose a new arbiter. Only callable by the stored depositor.
@@ -802,6 +825,8 @@ impl EscrowContract {
             (Symbol::new(&env, "arbiter_rotation_proposed"),),
             (depositor, new_arbiter, now),
         );
+
+        bump_instance_ttl(&env);
     }
 
     /// Accept the pending arbiter rotation after the minimum time-lock.
@@ -860,6 +885,13 @@ impl EscrowContract {
             (Symbol::new(&env, "arbiter_rotation_accepted"),),
             (new_arbiter, now),
         );
+
+        bump_instance_ttl(&env);
+    }
+
+    /// Extend instance storage lifetime. Anyone can call this to keep a long-running escrow active.
+    pub fn bump(env: Env) {
+        bump_instance_ttl(&env);
     }
 
     // ─── Internal helpers ────────────────────────────────────────────────────
@@ -1011,6 +1043,8 @@ impl EscrowContract {
             ),
             (depositor.clone(), recipient.clone(), amount),
         );
+
+        bump_instance_ttl(&env);
     }
 
     fn assert_not_released(env: &Env) {
