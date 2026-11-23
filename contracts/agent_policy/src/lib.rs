@@ -69,10 +69,17 @@ pub enum DataKey {
     Window,
     WindowStart,
     Spent,
-    Frozen,
+    Allowlist,
 }
 
 // ─── Policy State ─────────────────────────────────────────────────────────────
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AllowlistEntry {
+    pub contract: Address,
+    pub fn_name: Symbol,
+}
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -86,7 +93,7 @@ pub struct PolicyState {
     pub window: u64,
     pub window_start: u64,
     pub spent: i128,
-    pub frozen: bool,
+    pub allowlist: Vec<AllowlistEntry>,
 }
 
 // ─── Contract Errors ──────────────────────────────────────────────────────────
@@ -105,14 +112,17 @@ pub enum PolicyError {
     OverLimit = 4,
     /// The agent key is not allowed to authorise this call.
     ForbiddenContext = 5,
-    /// Agent spending is currently frozen.
-    Frozen = 6,
+    /// The call is not present in the owner-managed allowlist.
+    NotAllowlisted = 6,
 }
 
 // ─── Contract ─────────────────────────────────────────────────────────────────
 
 #[contract]
 pub struct AgentPolicyAccount;
+
+const INSTANCE_TTL_THRESHOLD: u32 = 100_000;
+const INSTANCE_TTL_EXTEND_TO: u32 = 200_000;
 
 #[contractimpl]
 impl AgentPolicyAccount {
@@ -152,7 +162,8 @@ impl AgentPolicyAccount {
         env.storage().instance().set(&DataKey::Window, &window);
         env.storage().instance().set(&DataKey::WindowStart, &now);
         env.storage().instance().set(&DataKey::Spent, &0i128);
-        env.storage().instance().set(&DataKey::Frozen, &false);
+        env.storage().instance().set(&DataKey::Allowlist, &Vec::<AllowlistEntry>::new(&env));
+        Self::extend_instance_ttl(&env);
 
         env.events().publish(
             (
@@ -186,40 +197,62 @@ impl AgentPolicyAccount {
         );
     }
 
-    /// Freeze agent spending. Only callable by the owner.
-    pub fn freeze(env: Env) {
+    /// Replace the non-token contract-call allowlist. Token value calls remain
+    /// governed by the configured token and spending limit.
+    pub fn set_allowlist(env: Env, entries: Vec<AllowlistEntry>) {
         let owner = Self::owner(&env);
         owner.require_auth();
-        env.storage().instance().set(&DataKey::Frozen, &true);
+        env.storage().instance().set(&DataKey::Allowlist, &entries);
+        Self::extend_instance_ttl(&env);
         env.events().publish(
-            (Symbol::new(&env, "policy"), Symbol::new(&env, "frozen")),
-            (),
+            (Symbol::new(&env, "policy"), Symbol::new(&env, "allowlist_set")),
+            entries,
         );
     }
 
-    /// Unfreeze agent spending. Only callable by the owner.
-    pub fn unfreeze(env: Env) {
+    /// Add one contract/function pair to the allowlist.
+    pub fn allow(env: Env, contract: Address, fn_name: Symbol) {
         let owner = Self::owner(&env);
         owner.require_auth();
-        env.storage().instance().set(&DataKey::Frozen, &false);
+        let mut entries: Vec<AllowlistEntry> = env.storage().instance().get(&DataKey::Allowlist).unwrap_or(Vec::new(&env));
+        if !entries.iter().any(|entry| entry.contract == contract && entry.fn_name == fn_name) {
+            entries.push_back(AllowlistEntry { contract: contract.clone(), fn_name: fn_name.clone() });
+            env.storage().instance().set(&DataKey::Allowlist, &entries);
+        }
+        Self::extend_instance_ttl(&env);
         env.events().publish(
-            (Symbol::new(&env, "policy"), Symbol::new(&env, "unfrozen")),
-            (),
+            (Symbol::new(&env, "policy"), Symbol::new(&env, "allowlist_added")),
+            (contract, fn_name),
         );
     }
 
-    /// Replace the agent signing key. Only callable by the owner.
-    pub fn rotate_agent_key(env: Env, new_key: BytesN<32>) {
+    /// Remove one contract/function pair from the allowlist.
+    pub fn disallow(env: Env, contract: Address, fn_name: Symbol) {
         let owner = Self::owner(&env);
         owner.require_auth();
-        env.storage().instance().set(&DataKey::AgentKey, &new_key);
+        let entries: Vec<AllowlistEntry> = env.storage().instance().get(&DataKey::Allowlist).unwrap_or(Vec::new(&env));
+        let mut retained = Vec::new(&env);
+        for entry in entries.iter() {
+            if entry.contract != contract || entry.fn_name != fn_name { retained.push_back(entry); }
+        }
+        env.storage().instance().set(&DataKey::Allowlist, &retained);
+        Self::extend_instance_ttl(&env);
         env.events().publish(
-            (
-                Symbol::new(&env, "policy"),
-                Symbol::new(&env, "agent_key_rotated"),
-            ),
-            new_key,
+            (Symbol::new(&env, "policy"), Symbol::new(&env, "allowlist_removed")),
+            (contract, fn_name),
         );
+    }
+
+    /// Return the configured non-token contract-call allowlist.
+    pub fn get_allowlist(env: Env) -> Vec<AllowlistEntry> {
+        Self::owner(&env);
+        env.storage().instance().get(&DataKey::Allowlist).unwrap_or(Vec::new(&env))
+    }
+
+    /// Extend the instance storage TTL. Anyone may call this maintenance method.
+    pub fn bump(env: Env) {
+        Self::owner(&env);
+        Self::extend_instance_ttl(&env);
     }
 
     /// Return the current policy and window accounting.
@@ -259,15 +292,15 @@ impl AgentPolicyAccount {
                 .instance()
                 .get(&DataKey::Spent)
                 .expect("policy: state corrupted"),
-            frozen: env
-                .storage()
-                .instance()
-                .get(&DataKey::Frozen)
-                .expect("policy: state corrupted"),
+            allowlist: env.storage().instance().get(&DataKey::Allowlist).unwrap_or(Vec::new(&env)),
         }
     }
 
     // ─── Internal helpers ────────────────────────────────────────────────────
+
+    fn extend_instance_ttl(env: &Env) {
+        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND_TO);
+    }
 
     fn owner(env: &Env) -> Address {
         match env.storage().instance().get(&DataKey::Owner) {
@@ -350,10 +383,16 @@ impl CustomAccountInterface for AgentPolicyAccount {
                     return Err(PolicyError::ForbiddenContext);
                 }
                 total = total.checked_add(amount).ok_or(PolicyError::OverLimit)?;
+            } else if call.contract != token {
+                let allowlist: Vec<AllowlistEntry> = env.storage().instance().get(&DataKey::Allowlist).unwrap_or(Vec::new(&env));
+                if !allowlist.iter().any(|entry| entry.contract == call.contract && entry.fn_name == call.fn_name) {
+                    return Err(PolicyError::NotAllowlisted);
+                }
             }
         }
 
         if total == 0 {
+            Self::extend_instance_ttl(&env);
             return Ok(());
         }
 
@@ -403,6 +442,7 @@ impl CustomAccountInterface for AgentPolicyAccount {
             .instance()
             .set(&DataKey::WindowStart, &window_start);
         env.storage().instance().set(&DataKey::Spent, &new_spent);
+        Self::extend_instance_ttl(&env);
         Ok(())
     }
 }
