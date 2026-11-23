@@ -191,6 +191,16 @@ export function loadAgentState(key: string): string | undefined {
   return sqlite.loadAgentState(key);
 }
 
+/**
+ * Every agent-state entry whose key starts with `prefix`. Used by the MPP
+ * session sweeper to find channels without knowing their ids up front.
+ */
+export function listAgentStateByPrefix(prefix: string): Array<{ key: string; value: string }> {
+  return getDb()
+    .prepare(`SELECT key, value FROM agent_state WHERE substr(key, 1, ?) = ?`)
+    .all(prefix.length, prefix) as Array<{ key: string; value: string }>;
+}
+
 // ─── Pending approvals (#736) ─────────────────────────────────────────────────
 
 export type ApprovalStatus = 'pending_approval' | 'approved' | 'denied' | 'expired';

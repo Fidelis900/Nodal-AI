@@ -189,6 +189,10 @@ export const EnvSchema = z.object({
   // How long a pending approval waits for a decision before it expires.
   APPROVAL_TTL_MS: z.coerce.number().int().min(1_000).default(3_600_000),
 
+  // How often the MPP channel sweeper marks timed-out channels Expired and
+  // releases their spending reservations. Defaults to 60,000 (1 minute).
+  MPP_SESSION_SWEEP_INTERVAL_MS: z.coerce.number().int().min(1_000).default(60_000),
+
   // Counterparty policy for value-moving tasks: `allowlist` permits only the
   // listed destinations, `denylist` blocks them, `open` (default) permits any.
   PAYMENT_DESTINATION_POLICY: z
@@ -271,6 +275,19 @@ export const EnvSchema = z.object({
   // Health check HTTP server
   HEALTH_PORT: z.coerce.number().int().min(1).max(65535).default(3000),
 
+  /**
+   * Payments above this amount (in the agent's asset) are held for human
+   * approval before execution rather than submitted immediately.
+   * "0" disables the threshold (all tasks execute immediately).
+   * Defaults to "0" (threshold disabled).
+   */
+  APPROVAL_THRESHOLD: z
+    .string()
+    .regex(
+      /^\d+(\.\d{1,7})?$/,
+      "APPROVAL_THRESHOLD must be a non-negative decimal (e.g. '50' or '0')"
+    )
+    .default("0"),
   // Nano node RPC endpoint used by NanoPaymentTool.
   NANO_RPC_URL: z.string().url().default('http://127.0.0.1:7076'),
   // Nano signing seed (#975). Loaded from env or AWS Secrets Manager, never
@@ -547,6 +564,13 @@ export interface AgentConfig {
   readonly APPROVAL_TTL_MS: number;
 
   /**
+   * MPP channel sweep interval in milliseconds. The sweeper marks channels
+   * past their `timeoutAt` as `Expired` and releases their reservations.
+   * Defaults to 60,000 (1 minute).
+   */
+  readonly MPP_SESSION_SWEEP_INTERVAL_MS: number;
+
+  /**
    * Counterparty policy enforced for every value-moving task.
    * "allowlist" permits only PAYMENT_DESTINATIONS, "denylist" rejects them and
    * "open" (default) permits any destination.
@@ -801,6 +825,11 @@ export interface AgentConfig {
   readonly WEBHOOK_URL?: string | undefined;
   readonly WEBHOOK_SECRET?: string | undefined;
   /**
+   * Payments above this amount are held for human approval before execution.
+   * "0" means threshold is disabled — all tasks execute immediately.
+   * Defaults to "0".
+   */
+  readonly APPROVAL_THRESHOLD: string;
    * Bearer token required by the HTTP API. Separate from WEBHOOK_SECRET so
    * leaking one does not compromise the other. When unset WEBHOOK_SECRET is
    * accepted in its place (deprecated).
@@ -1098,6 +1127,7 @@ function parseConfigAndDerive(
     OTLP_ENDPOINT,
     WEBHOOK_URL,
     WEBHOOK_SECRET,
+    APPROVAL_THRESHOLD,
     DATABASE_URL,
     LLM_API_KEY: llmApiKey,
     VAULT_TOKEN: vaultToken,
@@ -1128,6 +1158,12 @@ function parseConfigAndDerive(
     MAX_X402_PAYMENTS_PER_MINUTE: raw.MAX_X402_PAYMENTS_PER_MINUTE,
     X402_NONCE_TTL_MS: raw.X402_NONCE_TTL_MS,
     MAX_SOROBAN_FEE_STROOPS: raw.MAX_SOROBAN_FEE_STROOPS,
+    APPROVAL_THRESHOLD,
+    ...(ALLOWED_X402_ORIGINS && { ALLOWED_X402_ORIGINS }),
+    ...(AGENT_SECRET_KEY_ARN && { AGENT_SECRET_KEY_ARN }),
+    ...(OTLP_ENDPOINT && { OTLP_ENDPOINT }),
+    ...(WEBHOOK_URL && { WEBHOOK_URL }),
+    ...(WEBHOOK_SECRET && { WEBHOOK_SECRET }),
     SPENDING_LIMITS_MAP: spendingLimitsMap,
     SPENDING_LIMITS_ALLOW_UNKNOWN: raw.SPENDING_LIMITS_ALLOW_UNKNOWN,
     PAYMENT_DESTINATIONS: paymentDestinations,

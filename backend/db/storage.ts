@@ -35,12 +35,10 @@ import * as sqlite from './sqlite';
 
 export type StorageBackend = 'sqlite' | 'postgres';
 
-export interface ReserveSpendingOptions {
-  assetKey: string;
-  amountStroops: bigint;
-  limitStroops: bigint;
-  sinceMs: number;
-  now?: number;
+/** A persisted MPP session: its channel id and JSON-serialized channel state. */
+export interface MppSessionRecord {
+  channelId: string;
+  state: string;
 }
 
 export interface Storage {
@@ -123,6 +121,8 @@ export interface Storage {
   /** MPP Session storage: save, load, and update channel states. */
   saveMppSession(channelId: string, state: string): Promise<void>;
   loadMppSession(channelId: string): Promise<string | undefined>;
+  /** Every persisted MPP session, for the expiry sweeper. */
+  listMppSessions(): Promise<MppSessionRecord[]>;
 
   /** X402 rate limiter: save, load, prune, and clear timestamp records. */
   saveX402RateRecord(timestamp: number): Promise<void>;
@@ -295,6 +295,13 @@ export class SqliteStorage implements Storage {
 
   async loadMppSession(channelId: string): Promise<string | undefined> {
     return sqlite.loadAgentState(`mpp_session:${channelId}`);
+  }
+
+  async listMppSessions(): Promise<MppSessionRecord[]> {
+    const prefix = 'mpp_session:';
+    return persistence
+      .listAgentStateByPrefix(prefix)
+      .map(({ key, value }) => ({ channelId: key.slice(prefix.length), state: value }));
   }
 
   async saveX402RateRecord(timestamp: number): Promise<void> {

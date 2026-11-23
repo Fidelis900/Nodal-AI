@@ -67,7 +67,10 @@ export const logger = pino({
     remove: true,
   },
   hooks: {
-    logMethod(args, method) {
+    logMethod(args, method, level) {
+      if (isVitest && level >= ERROR_LEVEL_THRESHOLD) {
+        testErrorLogCapture.push({ level, msg: extractLogMessage(args) });
+      }
       const redacted = args.map(redactSecrets);
       return method.apply(this, redacted as Parameters<typeof method>);
     },
