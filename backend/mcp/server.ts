@@ -12,10 +12,10 @@
  *   - Request bodies are limited to MCP_MAX_BODY_BYTES (default 1 MiB).
  */
 
-import { createHash, timingSafeEqual } from 'crypto';
-import { PayFiAgent } from '../agent';
+import { PayFiAgent, VALUE_MOVING_TASK_TYPES } from '../agent';
 import { config } from '../config';
 import { createLogger } from '../utils/logger';
+import { timingSafeEqual } from 'crypto';
 
 const log = createLogger('mcp');
 
@@ -44,8 +44,6 @@ export interface MCPResponse {
  * Constant-time string comparison to prevent timing-based token oracle attacks.
  */
 function safeEqual(a: string, b: string): boolean {
-  // Use Node's built-in timingSafeEqual for byte-level protection.
-  const { timingSafeEqual } = require('crypto') as typeof import('crypto');
   const aBuf = Buffer.from(a, 'utf8');
   const bBuf = Buffer.from(b, 'utf8');
   if (aBuf.length !== bBuf.length) {
@@ -77,6 +75,17 @@ function getMCPTools(agent: PayFiAgent): MCPTool[] {
     });
 }
 
+/**
+ * How value-moving tool calls are handled (#917):
+ *   approve (default) — create a pending approval; a human approves it via
+ *                       the dashboard / POST /approvals/:id before anything moves.
+ *   direct            — execute immediately. Refused on mainnet unless
+ *                       MCP_FORCE_DIRECT_PAYMENTS=true.
+ */
+function getPaymentMode(): 'approve' | 'direct' {
+  return process.env.MCP_PAYMENT_MODE === 'direct' ? 'direct' : 'approve';
+}
+
 function toolToMCPSchema(tool: MCPTool): object {
   return {
     name: tool.name,
@@ -88,7 +97,10 @@ function toolToMCPSchema(tool: MCPTool): object {
 /**
  * Handle MCP request and return response.
  */
-async function handleRequest(agent: PayFiAgent, request: MCPRequest): Promise<MCPResponse> {
+export async function handleRequest(
+  agent: PayFiAgent,
+  request: MCPRequest
+): Promise<MCPResponse> {
   const { id } = request;
 
   try {
@@ -166,9 +178,11 @@ export async function startMCPServer(agent: PayFiAgent): Promise<void> {
   log.info('Starting MCP stdio server');
 
   const readline = await import('readline');
+  // Do NOT pass `output` here. In stdio MCP mode stdout is the exclusive
+  // JSON-RPC channel; giving readline a reference to it causes echo writes
+  // that would corrupt the protocol stream even with terminal:false.
   const rl = readline.createInterface({
     input: process.stdin,
-    output: process.stdout,
     terminal: false,
   });
 
@@ -199,6 +213,7 @@ export async function startMCPServer(agent: PayFiAgent): Promise<void> {
  *   - Refuses to start when MCP_ALLOW_PAYMENTS=true and no token is set.
  */
 import express from 'express';
+import type { Server } from 'http';
 
 /**
  * Constant-time token comparison; both sides are hashed so the buffers are
@@ -211,11 +226,10 @@ function tokensMatch(given: string, expected: string): boolean {
 }
 
 export function startMCPHTTPServer(agent: PayFiAgent, port = 3001): void {
-  const allowPayments = process.env.MCP_ALLOW_PAYMENTS === 'true';
-  const apiToken = process.env.MCP_API_TOKEN;
-  const host = process.env.MCP_HOST ?? '127.0.0.1';
-  // 1 MiB default; env var allows operator override within reason.
-  const maxBodyBytes = parseInt(process.env.MCP_MAX_BODY_BYTES ?? '1048576', 10);
+  const allowPayments = config.MCP_ALLOW_PAYMENTS;
+  const apiToken = config.MCP_API_TOKEN;
+  const host = config.MCP_HOST;
+  const maxBodyBytes = config.MCP_MAX_BODY_BYTES;
 
   // Hard safety check: payments enabled without a token is not allowed.
   if (allowPayments && !apiToken) {
@@ -241,9 +255,7 @@ export function startMCPHTTPServer(agent: PayFiAgent, port = 3001): void {
   if (apiToken) {
     app.use((req, res, next) => {
       const authHeader = req.headers['authorization'] ?? '';
-      const supplied = authHeader.startsWith('Bearer ')
-        ? authHeader.slice('Bearer '.length)
-        : '';
+      const supplied = authHeader.startsWith('Bearer ') ? authHeader.slice('Bearer '.length) : '';
 
       if (!safeEqual(supplied, apiToken)) {
         res.status(401).json({ error: 'Unauthorized' });

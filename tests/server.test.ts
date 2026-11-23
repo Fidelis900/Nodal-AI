@@ -43,6 +43,7 @@ vi.mock('../backend/config', () => ({
     HORIZON_URL: 'https://horizon-testnet.stellar.org',
     SOROBAN_RPC_URL: 'https://soroban-testnet.stellar.org',
   },
+  getAdminApiToken: () => process.env.ADMIN_API_TOKEN || process.env.WEBHOOK_SECRET || undefined,
 }));
 
 // Mock persistence module — getResults returns controlled data, or throws

@@ -3,41 +3,19 @@
  * Singleton Pino logger. Import `logger` or use `createLogger` for component-scoped child loggers.
  * Set LOG_LEVEL env var to control verbosity (default: "info").
  * Set NODE_ENV=production to emit raw JSON; otherwise prettified output is used.
+ *
+ * When MCP_TRANSPORT=stdio, stdout is the exclusive JSON-RPC channel.
+ * All log output is routed to stderr (fd 2) in that mode so log lines never
+ * corrupt the protocol stream.
  */
 
 import pino from 'pino';
+import { config } from '../config';
 
-const isDev = process.env.NODE_ENV !== 'production';
-const isVitest = process.env.VITEST === 'true';
+const isDev = config.NODE_ENV !== 'production';
 
-// error (50) and fatal (60) — see https://getpino.io/#/docs/api?id=level-string
-const ERROR_LEVEL_THRESHOLD = 50;
-
-/**
- * Error/fatal log entries captured during a Vitest run (#1006). Read and
- * cleared by tests/helpers/expectLoggedError.ts's global afterEach, which
- * fails a test whose code path logged an error/fatal that the test didn't
- * explicitly allow via `expectLoggedError()`. Always empty outside Vitest.
- */
-export const testErrorLogCapture: { level: number; msg: string }[] = [];
-
-/** Pulls a human-readable message out of a pino log call's argument list. */
-function extractLogMessage(args: unknown[]): string {
-  for (const arg of args) {
-    if (typeof arg === 'string') return arg;
-    if (arg instanceof Error) return arg.message;
-    // pino treats a `msg` field on the merging object as the log message
-    // when no separate message argument is given (e.g. log.error({ msg: '...' })).
-    if (
-      arg !== null &&
-      typeof arg === 'object' &&
-      typeof (arg as { msg?: unknown }).msg === 'string'
-    ) {
-      return (arg as { msg: string }).msg;
-    }
-  }
-  return '';
-}
+/** True when the process is acting as an MCP stdio server. */
+const isMCPStdio = process.env.MCP_TRANSPORT === 'stdio' || process.env.MCP_TRANSPORT === undefined;
 
 // Transaction memos (e.g. the nonce slices X402PaymentTool writes) can carry
 // caller-supplied, potentially user-identifiable strings, so they're stripped
@@ -83,7 +61,7 @@ export function redactSecrets(value: unknown): unknown {
 }
 
 export const logger = pino({
-  level: process.env.LOG_LEVEL ?? 'info',
+  level: config.LOG_LEVEL ?? 'info',
   redact: {
     paths: REDACT_PATHS,
     remove: true,
@@ -100,10 +78,17 @@ export const logger = pino({
   ...(isDev && {
     transport: {
       target: 'pino-pretty',
-      options: { colorize: true },
+      options: {
+        colorize: true,
+        ...(isMCPStdio && { destination: 2 }),
+      },
     },
   }),
-});
+};
+
+export const logger = isMCPStdio && !isDev
+  ? pino(pinoOptions, pino.destination(2))
+  : pino(pinoOptions);
 
 /**
  * Returns a child logger pre-tagged with `component` and an optional `correlationId`.

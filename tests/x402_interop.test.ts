@@ -20,6 +20,8 @@ import { _setDb } from '../backend/persistence';
 import { spendingTracker } from '../backend/spending_tracker';
 import { x402RateLimiter } from '../backend/x402_rate_limiter';
 import type { Signer } from '../backend/signer';
+import { RpcUnavailableError } from '../backend/errors';
+import { sorobanServer } from '../backend/rpc_client';
 
 // ─── Mock dependencies ────────────────────────────────────────────────────────
 
@@ -68,6 +70,20 @@ vi.mock('../backend/config', () => {
     MCP_HOST: '127.0.0.1',
     MCP_MAX_BODY_BYTES: 1_048_576,
     HEALTH_PORT: 3000,
+    NANO_ENABLED: false,
+    OTEL_REDACT_TX_HASH: false,
+    NODE_ENV: 'test',
+    LOG_LEVEL: 'info',
+    ALERT_SPENDING_THRESHOLDS: [0.8, 1],
+    ALERT_FAILURE_THRESHOLD: 5,
+    ALERT_FAILURE_WINDOW_MS: 300_000,
+    LLM_MAX_TOKENS_PER_REQUEST: 8_000,
+    LLM_MAX_TOKENS_PER_STEP: 16_000,
+    LLM_MAX_TOOL_CALL_ITERATIONS: 25,
+    LLM_MAX_TOKENS_PER_DAY: 1_000_000,
+    SESSION_TTL_MS: 1_800_000,
+    SESSION_MAX_MESSAGES: 50,
+    SESSION_MAX_SESSIONS: 500,
     WEBHOOK_URL: undefined,
     WEBHOOK_SECRET: undefined,
     ADMIN_API_TOKEN: undefined,
@@ -90,6 +106,7 @@ vi.mock('../backend/config', () => {
 
   return {
     config: mockConfig,
+    getNanoSeed: () => undefined,
   };
 });
 
@@ -103,6 +120,7 @@ vi.mock('../backend/signer', () => ({
 vi.mock('../backend/rpc_client', async (importOriginal) => ({
   ...(await importOriginal<object>()),
   withRetry: (fn: () => Promise<unknown>) => fn(),
+  sorobanServer: { getLatestLedger: vi.fn() },
   horizonServer: {
     ledgers: vi.fn().mockReturnValue({
       ledger: vi.fn().mockReturnValue({
@@ -133,7 +151,11 @@ vi.mock('../backend/tools/StellarPaymentTool', async (importOriginal) => ({
 
 // The seam X402FetchClient talks through: signing and header encoding belong to
 // the x402 packages, the guards and the spend accounting under test are ours.
-const { httpClient } = vi.hoisted(() => ({
+const { httpClient, stellarSigners } = vi.hoisted(() => ({
+  // Signer adapters handed to ExactStellarScheme, one per X402FetchClient.
+  stellarSigners: [] as Array<{
+    signAuthEntry: (entryXdr: string, opts: { networkPassphrase: string }) => Promise<string>;
+  }>,
   httpClient: {
     getPaymentRequiredResponse: vi.fn(),
     createPaymentPayload: vi.fn(),
@@ -156,7 +178,11 @@ vi.mock('@x402/core/client', () => ({
 }));
 
 vi.mock('@x402/stellar/exact/client', () => ({
-  ExactStellarScheme: class {},
+  ExactStellarScheme: class {
+    constructor(signer: (typeof stellarSigners)[number]) {
+      stellarSigners.push(signer);
+    }
+  },
 }));
 
 // ─── Helper functions ─────────────────────────────────────────────────────────

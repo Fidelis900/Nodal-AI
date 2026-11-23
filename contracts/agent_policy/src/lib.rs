@@ -34,6 +34,30 @@ use soroban_sdk::{
     BytesN, Env, Symbol, TryIntoVal, Val, Vec,
 };
 
+/// Owner can withdraw funds from the contract account without spending limits.
+/// This provides a recovery path if the agent key is lost.
+#[contractimpl]
+impl AgentPolicyAccount {
+    pub fn owner_withdraw(env: Env, to: Address, amount: i128) {
+        // Load the stored owner address.
+        let owner: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Owner)
+            .expect("owner not set");
+        // Require explicit auth from the owner.
+        owner.require_auth();
+        // Load the token address used for spending.
+        let token: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Token)
+            .expect("token not set");
+        // Transfer the requested amount from this contract to the destination.
+        token.transfer(&env.current_contract_address(), &to, &amount);
+    }
+}
+
 // ─── Storage keys ─────────────────────────────────────────────────────────────
 
 #[contracttype]
@@ -52,6 +76,8 @@ pub enum DataKey {
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PolicyState {
+    // NOTE: This struct is part of the `agent_policy` crate which should be included in the workspace defined at `contracts/Cargo.toml`.
+
     pub owner: Address,
     pub token: Address,
     pub limit: i128,

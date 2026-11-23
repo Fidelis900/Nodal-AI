@@ -158,6 +158,84 @@ describe('config.ts startup validation', () => {
       expect.stringContaining('AGENT_SECRET_KEY is not a valid Stellar secret key')
     );
   });
+
+  it('rejects invalid alert, LLM budget, and session settings with field-specific errors', async () => {
+    delete process.env.AGENT_SECRET_KEY;
+    delete process.env.AGENT_SECRET_KEY_ARN;
+    const { EnvSchema } = await import('../backend/config');
+    const validEnv = {
+      STELLAR_NETWORK: 'testnet',
+      HORIZON_URL: 'https://horizon-testnet.stellar.org',
+      SOROBAN_RPC_URL: 'https://soroban-testnet.stellar.org',
+      X402_ASSET_ISSUER: VALID_ISSUER,
+      AGENT_SECRET_KEY: VALID_SECRET,
+    };
+
+    const result = EnvSchema.safeParse({
+      ...validEnv,
+      ALERT_SPENDING_THRESHOLDS: '0.8,not-a-number',
+      LLM_MAX_TOKENS_PER_REQUEST: 'not-an-integer',
+      SESSION_TTL_MS: '0',
+    });
+
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error.issues.map((issue) => issue.path[0])).toEqual(
+        expect.arrayContaining([
+          'ALERT_SPENDING_THRESHOLDS',
+          'LLM_MAX_TOKENS_PER_REQUEST',
+          'SESSION_TTL_MS',
+        ])
+      );
+    }
+
+    expect(EnvSchema.parse(validEnv)).toMatchObject({
+      ALERT_SPENDING_THRESHOLDS: [0.8, 1],
+      ALERT_FAILURE_THRESHOLD: 5,
+      ALERT_FAILURE_WINDOW_MS: 300_000,
+      LLM_MAX_TOKENS_PER_REQUEST: 8_000,
+      SESSION_TTL_MS: 1_800_000,
+    });
+  });
+
+  it('fails startup with a field-specific message for invalid configured limits', async () => {
+    process.env.HORIZON_URL = 'https://horizon-testnet.stellar.org';
+    process.env.SOROBAN_RPC_URL = 'https://soroban-testnet.stellar.org';
+    process.env.X402_ASSET_ISSUER = VALID_ISSUER;
+    process.env.AGENT_SECRET_KEY = VALID_SECRET;
+    process.env.LLM_MAX_TOKENS_PER_REQUEST = 'not-an-integer';
+
+    await expect(async () => {
+      const { configPromise } = await import('../backend/config');
+      await configPromise;
+    }).rejects.toThrow('process.exit: 1');
+
+    expect(stderrSpy).toHaveBeenCalledWith(expect.stringContaining('LLM_MAX_TOKENS_PER_REQUEST'));
+  });
+
+  it('keeps Vault, OpenZeppelin, and LLM API keys off the public config object', async () => {
+    process.env.HORIZON_URL = 'https://horizon-testnet.stellar.org';
+    process.env.SOROBAN_RPC_URL = 'https://soroban-testnet.stellar.org';
+    process.env.X402_ASSET_ISSUER = VALID_ISSUER;
+    process.env.AGENT_SECRET_KEY = VALID_SECRET;
+    delete process.env.AGENT_SECRET_KEY_ARN;
+    delete process.env.NANO_SEED_ARN;
+    process.env.NANO_ENABLED = 'false';
+    process.env.VAULT_TOKEN = 'vault-test-token';
+    process.env.OZ_API_KEY = 'oz-test-key';
+    process.env.LLM_API_KEY = 'llm-test-key';
+
+    const { configPromise, getLLMApiKey, getOZApiKey, getVaultToken } =
+      await import('../backend/config');
+    const config = await configPromise;
+
+    expect(config).not.toHaveProperty('VAULT_TOKEN');
+    expect(config).not.toHaveProperty('OZ_API_KEY');
+    expect(config).not.toHaveProperty('LLM_API_KEY');
+    expect(getVaultToken()).toBe('vault-test-token');
+    expect(getOZApiKey()).toBe('oz-test-key');
+    expect(getLLMApiKey()).toBe('llm-test-key');
+  });
 });
 
 // ─── formatValidationErrors (pure-function tests) ────────────────────────────

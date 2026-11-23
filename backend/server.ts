@@ -26,7 +26,7 @@
 
 import * as http from 'http';
 import { createHash, timingSafeEqual } from 'crypto';
-import { config } from './config';
+import { config, getAdminApiToken } from './config';
 import { getResults } from './persistence';
 import { horizonServer, sorobanServer } from './rpc_client';
 import { db } from './db/client';
@@ -123,7 +123,7 @@ export async function checkDatabase(): Promise<ComponentStatus> {
  * request so a rotated value takes effect without re-importing the module.
  */
 function apiToken(): string | undefined {
-  return process.env.ADMIN_API_TOKEN || process.env.WEBHOOK_SECRET || undefined;
+  return getAdminApiToken();
 }
 
 /**
