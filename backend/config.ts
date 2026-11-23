@@ -135,6 +135,12 @@ export const EnvSchema = z.object({
     }),
   // SEP-41 contract (C…) of the x402 asset — its Stellar Asset Contract (SAC).
   // Derived from X402_ASSET_CODE + X402_ASSET_ISSUER when unset (#776).
+  AGENT_POLICY_ACCOUNT: z
+    .string()
+    .refine((val) => isValidStellarContractId(val), {
+      message: 'AGENT_POLICY_ACCOUNT must be a valid contract address (C…)',
+    })
+    .optional(),
   X402_ASSET_CONTRACT: z
     .string()
     .refine((val) => isValidStellarContractId(val), {
@@ -527,6 +533,8 @@ export interface AgentConfig {
    * Validated by EnvSchema to be a string between 1 and 12 characters.
    * Defaults to "USDC".
    */
+  /** Optional Soroban custom account used for policy-protected spending. */
+  readonly AGENT_POLICY_ACCOUNT?: string | undefined;
   readonly X402_ASSET_CODE: string;
 
   /**
@@ -1169,6 +1177,7 @@ function parseConfigAndDerive(
     SPENDING_LIMITS_ALLOW_UNKNOWN: raw.SPENDING_LIMITS_ALLOW_UNKNOWN,
     PAYMENT_DESTINATIONS: paymentDestinations,
     X402_ASSET_CONTRACT: x402AssetContract,
+    ...(raw.AGENT_POLICY_ACCOUNT ? { AGENT_POLICY_ACCOUNT: raw.AGENT_POLICY_ACCOUNT } : {}),
     ...(ALLOWED_X402_ORIGINS ? { ALLOWED_X402_ORIGINS } : {}),
     ...(AGENT_SECRET_KEY_ARN ? { AGENT_SECRET_KEY_ARN } : {}),
     ...(OTLP_ENDPOINT ? { OTLP_ENDPOINT } : {}),

@@ -50,6 +50,7 @@ import { metricsRegistry, renderMetrics, spendingWindowTotal } from './metrics';
 import { pauseAgent, resumeAgent, isPaused } from './kill_switch';
 import { assetKey as makeAssetKey } from './spending_tracker';
 import { stroopsToString } from './utils/amount';
+import { getOnChainPolicy } from './policy_account';
 
 const log = createLogger('health-server');
 
