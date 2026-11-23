@@ -756,7 +756,7 @@ describe('PayFiAgent guards', () => {
       vi.mocked(expirePendingApprovals).mockReturnValue([approval.id]);
 
       // Simulate restart: new agent instance without in-memory map
-      const freshAgent = new PayFiAgent(signer);
+      const freshAgent = new PayFiAgent();
       freshAgent.expireApprovals();
       expect(expirePendingApprovals).toHaveBeenCalled();
     });

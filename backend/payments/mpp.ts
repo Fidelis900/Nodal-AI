@@ -47,6 +47,7 @@ import { createAgentSigner, Signer } from '../signer';
 import { spendingTracker } from '../spending_tracker';
 import { SOROBAN_TX_TIMEOUT } from '../tools/SorobanInvokeTool';
 import { createLogger } from '../utils/logger';
+import { toStroops } from '../utils/amount';
 import { caip2Network } from '../x402/middleware';
 
 const log = createLogger('mpp-charge');
@@ -237,13 +238,13 @@ function reserveSpend(amount: string): string {
   if (isPaused()) {
     throw new AgentPausedError('Agent is paused; MPP charge payments are halted');
   }
-  const parsed = parseFloat(amount);
-  if (parsed > parseFloat(config.AGENT_SPENDING_LIMIT)) {
+  const parsed = toStroops(amount);
+  if (parsed > toStroops(config.AGENT_SPENDING_LIMIT)) {
     throw new PolicyViolationError(
       `MPP charge of ${amount} exceeds AGENT_SPENDING_LIMIT of ${config.AGENT_SPENDING_LIMIT}`
     );
   }
-  if (config.STELLAR_NETWORK === 'mainnet' && parsed > MAINNET_SPENDING_CAP) {
+  if (config.STELLAR_NETWORK === 'mainnet' && parsed > toStroops(String(MAINNET_SPENDING_CAP))) {
     throw new PolicyViolationError(
       `MPP charge of ${amount} exceeds mainnet spending cap of ${MAINNET_SPENDING_CAP}`
     );

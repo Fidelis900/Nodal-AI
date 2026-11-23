@@ -62,6 +62,7 @@ export interface HttpFetchOptions {
  * All backend outbound HTTP calls should use this instead of raw fetch.
  */
 export async function httpFetch(url: string, options: HttpFetchOptions = {}): Promise<Response> {
+  // eslint-disable-next-line no-restricted-properties
   const { timeoutMs = Number(process.env.HTTP_TIMEOUT_MS) || 5000, init = {} } = options;
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), timeoutMs);
@@ -85,7 +86,7 @@ import { createLogger } from '../utils/logger';
 import { fromStroops, toStroops, tryToStroops } from '../utils/amount';
 import { toCaip2 } from '../network';
 import { assetKey, spendingTracker } from '../spending_tracker';
-import { PolicyViolationError } from '../errors';
+import { PolicyViolationError, RpcUnavailableError } from '../errors';
 import type { Signer } from '../signer';
 import { resolveNetworkPassphrase, sorobanServer } from '../rpc_client';
 
@@ -216,6 +217,17 @@ function assetKeyForRequirement(asset: string): string {
 }
 
 /**
+ * Convert a PaymentRequirements amount to stroops. In x402 v2 `amount` is in
+ * the token's smallest unit; the payable assets are Stellar Asset Contracts
+ * wrapping classic assets, which always use 7 decimals, so one atomic unit is
+ * exactly one stroop (0.01 USDC is "100000").
+ */
+function atomicAmountToStroops(amount: string): bigint {
+  if (!/^\d+$/.test(amount)) throw new Error(`x402 v2: invalid payment amount "${amount}"`);
+  return BigInt(amount);
+}
+
+/**
  * Guard the amount from a PaymentRequirements against AGENT_SPENDING_LIMIT and
  * the mainnet hard cap. Throws with a clear message if either is exceeded.
  */
@@ -258,6 +270,51 @@ function assertPayToAllowed(payTo: string, selfAddress: string): void {
     throw new PolicyViolationError(
       `x402 v2: payTo ${payTo} is not permitted by the ${policy} payment destination policy`
     );
+  }
+}
+
+/** Hosts allowed over plain HTTP outside mainnet (local development). */
+const LOCALHOST_HOSTNAMES = new Set(['localhost', '127.0.0.1', '[::1]']);
+
+/**
+ * Normalise an ALLOWED_X402_ORIGINS entry to a full origin
+ * (`scheme://host[:port]`). Bare hostnames mean the default HTTPS origin.
+ */
+function normalizeOrigin(entry: string): string {
+  const withScheme = entry.includes('://') ? entry : `https://${entry}`;
+  try {
+    return new URL(withScheme).origin;
+  } catch {
+    return entry;
+  }
+}
+
+/**
+ * Guard the resource URL before any request is made: it must be HTTPS (plain
+ * HTTP only for localhost off mainnet) and, when ALLOWED_X402_ORIGINS is set,
+ * its full origin (scheme, host and port) must be listed.
+ */
+function assertOriginAllowed(url: URL): void {
+  if (url.protocol !== 'https:') {
+    const devLocalhost =
+      url.protocol === 'http:' &&
+      LOCALHOST_HOSTNAMES.has(url.hostname) &&
+      config.STELLAR_NETWORK !== 'mainnet';
+    if (!devLocalhost) {
+      throw new Error(`x402 v2: refusing non-HTTPS resource origin: ${url.origin}`);
+    }
+  }
+
+  if (config.ALLOWED_X402_ORIGINS) {
+    const allowedOrigins = new Set(
+      config.ALLOWED_X402_ORIGINS.split(',')
+        .map((o) => o.trim())
+        .filter((o) => o.length > 0)
+        .map(normalizeOrigin)
+    );
+    if (!allowedOrigins.has(url.origin)) {
+      throw new Error(`x402 v2: untrusted resource origin: ${url.origin}`);
+    }
   }
 }
 

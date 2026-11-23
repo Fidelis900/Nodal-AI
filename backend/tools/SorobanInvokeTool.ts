@@ -25,6 +25,7 @@ import {
 } from '../rpc_client';
 import { spendingTracker } from '../spending_tracker';
 import { stellarContractIdSchema } from '../utils/stellarSchemas';
+import { toStroops, tryToStroops } from '../utils/amount';
 
 // ─── Constants ─────────────────────────────────────────────────────────────────
 
@@ -381,16 +382,15 @@ export class SorobanInvokeTool {
     if (totalRaw <= 0n) return;
 
     const amountStr = sacRawToDecimal(totalRaw);
-    const parsed = parseFloat(amountStr);
-    const limit = parseFloat(config.AGENT_SPENDING_LIMIT);
+    const limitStroops = tryToStroops(config.AGENT_SPENDING_LIMIT);
 
-    if (!isNaN(parsed) && !isNaN(limit) && parsed > limit) {
+    if (limitStroops !== null && totalRaw > limitStroops) {
       throw new Error(
         `Contract invocation transfers ${amountStr} ${config.X402_ASSET_CODE} exceeds ` +
           `AGENT_SPENDING_LIMIT of ${config.AGENT_SPENDING_LIMIT}`
       );
     }
-    if (!isNaN(parsed) && config.STELLAR_NETWORK === 'mainnet' && parsed > MAINNET_SPENDING_CAP) {
+    if (config.STELLAR_NETWORK === 'mainnet' && totalRaw > toStroops(String(MAINNET_SPENDING_CAP))) {
       throw new Error(
         `Contract invocation transfers ${amountStr} ${config.X402_ASSET_CODE} exceeds ` +
           `mainnet spending cap of ${MAINNET_SPENDING_CAP}`

@@ -23,6 +23,7 @@ import * as dotenv from 'dotenv';
 import { Asset, Keypair, Networks } from '@stellar/stellar-sdk';
 import { SecretsManagerClient, GetSecretValueCommand } from '@aws-sdk/client-secrets-manager';
 import { isValidStellarContractId, isValidStellarPublicKey } from './utils/stellarSchemas';
+import { toStroops, tryToStroops } from './utils/amount';
 
 export const MAINNET_SPENDING_CAP = 10_000;
 
@@ -969,8 +970,8 @@ function parseConfigAndDerive(
 
   // ── Mainnet safety guard ───────────────────────────────────────────────────
   if (raw.STELLAR_NETWORK === 'mainnet') {
-    const limit = parseFloat(raw.AGENT_SPENDING_LIMIT);
-    if (limit > MAINNET_SPENDING_CAP) {
+    const limitStroops = tryToStroops(raw.AGENT_SPENDING_LIMIT);
+    if (limitStroops !== null && limitStroops > toStroops(String(MAINNET_SPENDING_CAP))) {
       process.stderr.write(
         `❌ [Config] AGENT_SPENDING_LIMIT (${raw.AGENT_SPENDING_LIMIT}) exceeds ` +
           `the mainnet safety cap of ${MAINNET_SPENDING_CAP.toLocaleString('en-US')}. Lower it or explicitly override.\n`

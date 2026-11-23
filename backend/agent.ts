@@ -301,11 +301,15 @@ function assertDestinationsAllowed(task: AgentTask): void {
 function taskAmount(task: AgentTask): string | null {
   const p = (task.payload ?? {}) as Record<string, unknown>;
   if (task.type === 'batch_payment' && Array.isArray(p.payments)) {
-    const total = p.payments.reduce((sum: number, pay: unknown) => {
-      const amt = parseFloat((pay as Record<string, unknown>)?.amount as string);
-      return sum + (isNaN(amt) ? 0 : amt);
-    }, 0);
-    return String(total);
+    let totalStroops = 0n;
+    for (const pay of p.payments) {
+      const amtStr = (pay as Record<string, unknown>)?.amount;
+      if (typeof amtStr === 'string') {
+        const s = tryToStroops(amtStr);
+        if (s !== null) totalStroops += s;
+      }
+    }
+    return stroopsToString(totalStroops);
   }
   const amount = task.type === 'path_payment' ? p.sendAmount : p.amount;
   return typeof amount === 'string' ? amount : null;
@@ -1070,7 +1074,10 @@ export class PayFiAgent extends EventEmitter<AgentEvents> {
       amount = amount ?? '0';
     } else {
       if (config.APPROVAL_THRESHOLD === undefined) return null;
-      if (amount === null || !(parseFloat(amount) > parseFloat(config.APPROVAL_THRESHOLD))) {
+      if (amount === null) return null;
+      const amtStroops = tryToStroops(amount);
+      const threshStroops = tryToStroops(config.APPROVAL_THRESHOLD);
+      if (amtStroops === null || threshStroops === null || !(amtStroops > threshStroops)) {
         return null;
       }
     }

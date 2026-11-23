@@ -177,13 +177,13 @@ function reserveChannelSpend(amount: string): string {
   if (isPaused()) {
     throw new AgentPausedError('Agent is paused; MPP session operations are halted');
   }
-  const parsed = parseFloat(amount);
-  if (parsed > parseFloat(config.AGENT_SPENDING_LIMIT)) {
+  const parsed = toStroops(amount);
+  if (parsed > toStroops(config.AGENT_SPENDING_LIMIT)) {
     throw new PolicyViolationError(
       `MPP session total of ${amount} exceeds AGENT_SPENDING_LIMIT of ${config.AGENT_SPENDING_LIMIT}`
     );
   }
-  if (config.STELLAR_NETWORK === 'mainnet' && parsed > MAINNET_SPENDING_CAP) {
+  if (config.STELLAR_NETWORK === 'mainnet' && parsed > toStroops(String(MAINNET_SPENDING_CAP))) {
     throw new PolicyViolationError(
       `MPP session total of ${amount} exceeds mainnet spending cap of ${MAINNET_SPENDING_CAP}`
     );

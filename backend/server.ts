@@ -33,6 +33,7 @@ import { db } from './db/client';
 import { handleError } from './middleware/error_handler';
 import { createLogger } from './utils/logger';
 import { spendingTracker, type PayFiAgent } from './agent';
+import { amountToNumber } from './utils/amount';
 import { llmUsage } from './ai/llm';
 import { metricsRegistry, renderMetrics, spendingWindowTotal } from './metrics';
 import { pauseAgent, resumeAgent, isPaused } from './kill_switch';
@@ -267,12 +268,12 @@ export function createHealthServer(agent?: PayFiAgent): http.Server {
       }
 
       const total = spendingTracker.total();
-      const limit = parseFloat(config.AGENT_SPENDING_LIMIT);
+      const limit = amountToNumber(config.AGENT_SPENDING_LIMIT);
       const body = JSON.stringify({
         total,
         limit,
         windowMs: config.SPENDING_WINDOW_MS,
-        percentUsed: (total / limit) * 100,
+        percentUsed: limit > 0 ? (total / limit) * 100 : 0,
         usage: buildSpendingUsage(),
       });
 
@@ -306,10 +307,10 @@ export function createHealthServer(agent?: PayFiAgent): http.Server {
         llm: llmMetrics,
         spending: {
           ...spendingStatus,
-          limit: parseFloat(config.AGENT_SPENDING_LIMIT),
+          limit: amountToNumber(config.AGENT_SPENDING_LIMIT),
           percentUsed:
-            spendingStatus.total > 0
-              ? (spendingStatus.total / parseFloat(config.AGENT_SPENDING_LIMIT)) * 100
+            spendingStatus.total > 0 && amountToNumber(config.AGENT_SPENDING_LIMIT) > 0
+              ? (spendingStatus.total / amountToNumber(config.AGENT_SPENDING_LIMIT)) * 100
               : 0,
         },
       });
@@ -653,10 +654,10 @@ function handleStream(
     sendEvent('initial', {
       spending: {
         ...spendingStatus,
-        limit: parseFloat(config.AGENT_SPENDING_LIMIT),
+        limit: amountToNumber(config.AGENT_SPENDING_LIMIT),
         percentUsed:
-          spendingStatus.total > 0
-            ? (spendingStatus.total / parseFloat(config.AGENT_SPENDING_LIMIT)) * 100
+          spendingStatus.total > 0 && amountToNumber(config.AGENT_SPENDING_LIMIT) > 0
+            ? (spendingStatus.total / amountToNumber(config.AGENT_SPENDING_LIMIT)) * 100
             : 0,
       },
       approvals,
@@ -682,10 +683,10 @@ function handleStream(
         const spendingStatus = spendingTracker.getWindowStatus();
         sendEvent('spending', {
           ...spendingStatus,
-          limit: parseFloat(config.AGENT_SPENDING_LIMIT),
+          limit: amountToNumber(config.AGENT_SPENDING_LIMIT),
           percentUsed:
-            spendingStatus.total > 0
-              ? (spendingStatus.total / parseFloat(config.AGENT_SPENDING_LIMIT)) * 100
+            spendingStatus.total > 0 && amountToNumber(config.AGENT_SPENDING_LIMIT) > 0
+              ? (spendingStatus.total / amountToNumber(config.AGENT_SPENDING_LIMIT)) * 100
               : 0,
           timestamp: new Date().toISOString(),
         });
