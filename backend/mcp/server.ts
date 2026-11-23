@@ -15,7 +15,7 @@
 import { PayFiAgent } from '../agent';
 import { config } from '../config';
 import { createLogger } from '../utils/logger';
-import { timingSafeEqual } from 'crypto';
+import { createHash, timingSafeEqual } from 'crypto';
 
 const log = createLogger('mcp');
 
@@ -73,6 +73,18 @@ function getMCPTools(agent: PayFiAgent): MCPTool[] {
       if (!tool.valueMoving) return true;
       return allowPayments;
     });
+}
+
+/**
+ * How value-moving tool calls are handled (#917):
+ *   approve (default) — create a pending approval; a human approves it via
+ *                       the dashboard / POST /approvals/:id before anything moves.
+ *   direct            — execute immediately. Refused on mainnet unless
+ *                       MCP_FORCE_DIRECT_PAYMENTS=true.
+ */
+function getPaymentMode(): 'approve' | 'direct' {
+  // eslint-disable-next-line no-restricted-properties
+  return process.env.MCP_PAYMENT_MODE === 'direct' ? 'direct' : 'approve';
 }
 
 function toolToMCPSchema(tool: MCPTool): object {
@@ -200,6 +212,16 @@ export async function startMCPServer(agent: PayFiAgent): Promise<void> {
  */
 import express from 'express';
 import type { Server } from 'http';
+
+/**
+ * Constant-time token comparison; both sides are hashed so the buffers are
+ * always the same length.
+ */
+function tokensMatch(given: string, expected: string): boolean {
+  const a = createHash('sha256').update(given).digest();
+  const b = createHash('sha256').update(expected).digest();
+  return timingSafeEqual(a, b);
+}
 
 export function startMCPHTTPServer(agent: PayFiAgent, port = 3001): Server {
   const allowPayments = config.MCP_ALLOW_PAYMENTS;

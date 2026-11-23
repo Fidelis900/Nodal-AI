@@ -30,6 +30,17 @@
  * Port is read from config.HEALTH_PORT (env var HEALTH_PORT, default 3000).
  */
 
+import * as http from "http";
+import { config } from "./config";
+import { getResults } from "./persistence";
+import { horizonServer, sorobanServer } from "./rpc_client";
+import { db } from "./db/client";
+import { handleError } from "./middleware/error_handler";
+import { createLogger } from "./utils/logger";
+import { approvalStore } from "./approval_store";
+import type { PayFiAgent } from "./agent";
+
+const log = createLogger("health-server");
 import * as http from 'http';
 import { createHash, randomUUID, timingSafeEqual } from 'crypto';
 import { config, getAdminApiToken } from './config';
@@ -38,12 +49,14 @@ import { horizonServer, sorobanServer } from './rpc_client';
 import { db } from './db/client';
 import { handleError } from './middleware/error_handler';
 import { createLogger } from './utils/logger';
-import { spendingTracker, type PayFiAgent, type AgentResult } from './agent';
+import { spendingTracker, type PayFiAgent } from './agent';
+import { amountToNumber } from './utils/amount';
 import { llmUsage } from './ai/llm';
 import { metricsRegistry, renderMetrics, spendingWindowTotal } from './metrics';
 import { pauseAgent, resumeAgent, isPaused } from './kill_switch';
 import { assetKey as makeAssetKey } from './spending_tracker';
 import { stroopsToString } from './utils/amount';
+import { getOnChainPolicy } from './policy_account';
 
 const log = createLogger('health-server');
 
@@ -178,95 +191,10 @@ function isStrictlyAuthenticated(req: http.IncomingMessage): boolean {
   return Boolean(apiToken()) && isAuthenticated(req);
 }
 
-// ─── SSE stream tickets (#965) ─────────────────────────────────────────────
-//
-// An EventSource cannot set an Authorization header, so GET /stream cannot
-// use ordinary Bearer auth. POST /stream/ticket (which *can* use a header,
-// since it's a normal fetch) exchanges the admin token for a short-lived,
-// single-use ticket that's safe to put in the stream URL: it's useless to
-// anyone who captures it from a log after STREAM_TICKET_TTL_MS, and useless
-// a second time to anyone who captures it before that.
-
-const STREAM_TICKET_TTL_MS = 60_000;
-const streamTickets = new Map<string, number>(); // ticket -> expiresAt (epoch ms)
-
-function pruneExpiredStreamTickets(now: number): void {
-  for (const [ticket, expiresAt] of streamTickets) {
-    if (expiresAt <= now) streamTickets.delete(ticket);
-  }
-}
-
-/** Issues a new ticket, valid for one GET /stream connection within STREAM_TICKET_TTL_MS. */
-function issueStreamTicket(): string {
-  const now = Date.now();
-  pruneExpiredStreamTickets(now);
-  const ticket = randomUUID();
-  streamTickets.set(ticket, now + STREAM_TICKET_TTL_MS);
-  return ticket;
-}
-
-/** Consumes `ticket` if (and only if) it exists and has not expired. Always single-use. */
-function consumeStreamTicket(ticket: string): boolean {
-  const expiresAt = streamTickets.get(ticket);
-  streamTickets.delete(ticket); // single-use: gone whether or not it was valid
-  return expiresAt !== undefined && expiresAt > Date.now();
-}
-
-/**
- * Auth check for GET /stream only: a normal Bearer header (for non-browser
- * clients that can set one), or a valid `ticket` query parameter minted by
- * POST /stream/ticket. Never a raw token in the query string (#965).
- */
-function isStreamAuthenticated(req: http.IncomingMessage): boolean {
-  if (isAuthenticated(req)) return true;
-
-  const url = req.url;
-  if (!url) return false;
-  try {
-    const parsed = new URL(url, `http://${req.headers.host ?? 'localhost'}`);
-    const ticket = parsed.searchParams.get('ticket');
-    return !!ticket && consumeStreamTicket(ticket);
-  } catch {
-    return false;
-  }
-}
-
-// ─── CORS (#966) ────────────────────────────────────────────────────────────
-//
-// Unset CORS_ALLOWED_ORIGINS (default) means no CORS at all: no
-// Access-Control-* header is ever sent, so a cross-origin browser request
-// simply fails the way it always has. When set, only an exact origin on the
-// list gets the preflight response and the Access-Control-Allow-Origin
-// header — the origin is echoed back, never "*", since this API uses
-// credentials (the Bearer token).
-function corsAllowedOrigins(): Set<string> {
-  if (!config.CORS_ALLOWED_ORIGINS) return new Set();
-  return new Set(config.CORS_ALLOWED_ORIGINS.split(',').map((o) => o.trim()));
-}
-
-/**
- * Sets CORS headers when `req`'s Origin is allowed, and answers an OPTIONS
- * preflight directly. Returns true when the caller should stop (the request
- * was an OPTIONS preflight and has already been answered).
- */
-function applyCors(req: http.IncomingMessage, res: http.ServerResponse): boolean {
-  const origin = req.headers.origin;
-  if (origin && corsAllowedOrigins().has(origin)) {
-    res.setHeader('Access-Control-Allow-Origin', origin);
-    res.setHeader('Vary', 'Origin');
-    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-    res.setHeader('Access-Control-Allow-Headers', 'Authorization, Content-Type');
-  }
-
-  if (req.method === 'OPTIONS') {
-    res.writeHead(204);
-    res.end();
-    return true;
-  }
-
-  return false;
-}
-
+const HEALTH_PATH = "/health";
+const STATUS_PATH = "/status";
+const APPROVALS_PATH = "/approvals";
+const APPROVALS_ID_RE = /^\/approvals\/([^/?#]+)$/;
 /** One asset's share of the rolling spending window, as reported by GET /spending. */
 interface SpendingUsage {
   assetKey: string;
@@ -314,6 +242,10 @@ const ADMIN_RESUME_PATH = '/admin/resume';
 /**
  * Creates and returns the health-check HTTP server.
  * Does NOT call `.listen()` — the caller (typically `index.ts`) is responsible
+ * for binding to `config.HEALTH_PORT`.
+ *
+ * @param agent - Optional PayFiAgent instance. When provided, the server also
+ *   exposes `GET /approvals` and `POST /approvals/:id` for the approval flow.
  * for binding to `config.HEALTH_PORT`. The approval routes need `agent`; they
  * answer 503 without one.
  */
@@ -356,12 +288,12 @@ export function createHealthServer(agent?: PayFiAgent): http.Server {
       }
 
       const total = spendingTracker.total();
-      const limit = parseFloat(config.AGENT_SPENDING_LIMIT);
+      const limit = amountToNumber(config.AGENT_SPENDING_LIMIT);
       const body = JSON.stringify({
         total,
         limit,
         windowMs: config.SPENDING_WINDOW_MS,
-        percentUsed: (total / limit) * 100,
+        percentUsed: limit > 0 ? (total / limit) * 100 : 0,
         usage: buildSpendingUsage(),
       });
 
@@ -395,10 +327,10 @@ export function createHealthServer(agent?: PayFiAgent): http.Server {
         llm: llmMetrics,
         spending: {
           ...spendingStatus,
-          limit: parseFloat(config.AGENT_SPENDING_LIMIT),
+          limit: amountToNumber(config.AGENT_SPENDING_LIMIT),
           percentUsed:
-            spendingStatus.total > 0
-              ? (spendingStatus.total / parseFloat(config.AGENT_SPENDING_LIMIT)) * 100
+            spendingStatus.total > 0 && amountToNumber(config.AGENT_SPENDING_LIMIT) > 0
+              ? (spendingStatus.total / amountToNumber(config.AGENT_SPENDING_LIMIT)) * 100
               : 0,
         },
       });
@@ -496,6 +428,40 @@ export function createHealthServer(agent?: PayFiAgent): http.Server {
       resumeAgent('Resumed via HTTP API');
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ paused: false }));
+      return;
+    }
+
+    // ── GET /approvals ─────────────────────────────────────────────────────
+    if (req.method === "GET" && req.url === APPROVALS_PATH) {
+      if (!isAuthenticated(req)) {
+        res.writeHead(401, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "Unauthorized" }));
+        return;
+      }
+      const list = approvalStore.list();
+      const body = JSON.stringify({ approvals: list });
+      res.writeHead(200, {
+        "Content-Type": "application/json",
+        "Content-Length": Buffer.byteLength(body),
+      });
+      res.end(body);
+      return;
+    }
+
+    // ── POST /approvals/:id ────────────────────────────────────────────────
+    const approvalMatch = req.url ? APPROVALS_ID_RE.exec(req.url) : null;
+    if (req.method === "POST" && approvalMatch) {
+      if (!isAuthenticated(req)) {
+        res.writeHead(401, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "Unauthorized" }));
+        return;
+      }
+      if (!agent) {
+        res.writeHead(503, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "Agent not available" }));
+        return;
+      }
+      handleApprovalAction(req, res, approvalMatch[1]!, agent);
       return;
     }
 
@@ -883,19 +849,165 @@ function handleStream(
   startSseHubIfNeeded(agent);
 
   try {
-    sseSend(client, 'initial', {
-      spending: spendingSnapshot(),
-      approvals: lastSseApprovals,
-      paused: lastSsePaused,
+    const spendingStatus = spendingTracker.getWindowStatus();
+    const approvals = agent?.listApprovals() ?? [];
+    const paused = isPaused();
+
+    sendEvent('initial', {
+      spending: {
+        ...spendingStatus,
+        limit: amountToNumber(config.AGENT_SPENDING_LIMIT),
+        percentUsed:
+          spendingStatus.total > 0 && amountToNumber(config.AGENT_SPENDING_LIMIT) > 0
+            ? (spendingStatus.total / amountToNumber(config.AGENT_SPENDING_LIMIT)) * 100
+            : 0,
+      },
+      approvals,
+      paused,
       timestamp: new Date().toISOString(),
     });
   } catch (err) {
     log.error({ msg: 'Failed to send initial SSE state', err: String(err) });
   }
 
+  // Set up polling for updates (simple approach without event emitter changes)
+  const POLL_INTERVAL_MS = 2000;
+  let lastSpendingTotal = spendingTracker.total();
+  let lastApprovalCount = agent?.listApprovals().length ?? 0;
+  let lastPausedState = isPaused();
+
+  const interval = setInterval(() => {
+    try {
+      // Check for spending changes
+      const currentSpendingTotal = spendingTracker.total();
+      if (currentSpendingTotal !== lastSpendingTotal) {
+        lastSpendingTotal = currentSpendingTotal;
+        const spendingStatus = spendingTracker.getWindowStatus();
+        sendEvent('spending', {
+          ...spendingStatus,
+          limit: amountToNumber(config.AGENT_SPENDING_LIMIT),
+          percentUsed:
+            spendingStatus.total > 0 && amountToNumber(config.AGENT_SPENDING_LIMIT) > 0
+              ? (spendingStatus.total / amountToNumber(config.AGENT_SPENDING_LIMIT)) * 100
+              : 0,
+          timestamp: new Date().toISOString(),
+        });
+      }
+
+      // Check for approval changes
+      if (agent) {
+        const currentApprovals = agent.listApprovals();
+        if (currentApprovals.length !== lastApprovalCount) {
+          lastApprovalCount = currentApprovals.length;
+          sendEvent('approvals', {
+            approvals: currentApprovals,
+            timestamp: new Date().toISOString(),
+          });
+        }
+      }
+
+      // Check for pause/resume changes
+      const currentPaused = isPaused();
+      if (currentPaused !== lastPausedState) {
+        lastPausedState = currentPaused;
+        sendEvent('pause', {
+          paused: currentPaused,
+          timestamp: new Date().toISOString(),
+        });
+      }
+
+      // Send periodic heartbeat
+      sendEvent('heartbeat', { timestamp: new Date().toISOString() });
+    } catch (err) {
+      log.error({ msg: 'SSE polling error', err: String(err) });
+    }
+  }, POLL_INTERVAL_MS);
+
+  // Clean up on client disconnect
   req.on('close', () => {
     sseClients.delete(client);
     stopSseHubIfIdle();
     log.info('SSE client disconnected');
+  });
+}
+
+/**
+ * Handle POST /approvals/:id
+ *
+ * Body JSON: `{ "action": "approve" | "deny" }`
+ *
+ * - approve → calls agent.executeApproved(id), returns the AgentResult
+ * - deny    → calls approvalStore.deny(id), returns the updated entry
+ *
+ * Both paths are idempotent-safe: attempting to approve/deny an already-
+ * processed entry returns 409 Conflict.
+ */
+function handleApprovalAction(
+  req: http.IncomingMessage,
+  res: http.ServerResponse,
+  id: string,
+  agent: PayFiAgent
+): void {
+  let body = "";
+  req.on("data", (chunk: Buffer | string) => {
+    body += chunk.toString();
+  });
+  req.on("end", () => {
+    void (async () => {
+      try {
+        let parsed: { action?: string };
+        try {
+          parsed = JSON.parse(body || "{}");
+        } catch {
+          res.writeHead(400, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "Invalid JSON body" }));
+          return;
+        }
+
+        const action = parsed.action;
+        if (action !== "approve" && action !== "deny") {
+          res.writeHead(400, { "Content-Type": "application/json" });
+          res.end(
+            JSON.stringify({ error: 'body must contain { "action": "approve" | "deny" }' })
+          );
+          return;
+        }
+
+        if (action === "deny") {
+          const entry = approvalStore.deny(id);
+          const payload = JSON.stringify({ approval: entry });
+          res.writeHead(200, {
+            "Content-Type": "application/json",
+            "Content-Length": Buffer.byteLength(payload),
+          });
+          res.end(payload);
+          return;
+        }
+
+        // action === "approve"
+        const result = await agent.executeApproved(id);
+        const payload = JSON.stringify({ result });
+        res.writeHead(200, {
+          "Content-Type": "application/json",
+          "Content-Length": Buffer.byteLength(payload),
+        });
+        res.end(payload);
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        // Distinguish "not found / wrong state" (409) from actual failures (500)
+        const isConflict =
+          message.includes("already") ||
+          message.includes("not found") ||
+          message.includes("expired");
+        const statusCode = isConflict ? 409 : 500;
+        log.error({ msg: "Approval action failed", id, error: message });
+        const payload = JSON.stringify({ error: message });
+        res.writeHead(statusCode, {
+          "Content-Type": "application/json",
+          "Content-Length": Buffer.byteLength(payload),
+        });
+        res.end(payload);
+      }
+    })();
   });
 }
